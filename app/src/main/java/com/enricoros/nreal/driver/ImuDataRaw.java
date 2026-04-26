@@ -14,8 +14,13 @@ public class ImuDataRaw {
   int magX, magY, magZ;
   long uptimeNs;
   String _tmpOther;
+  private final float[] gyroCalibrationRadiansPerSecond = new float[3];
 
   void update(int accelX, int accelY, int accelZ, int angVelX, int angVelY, int angVelZ, int magX, int magY, int magZ, long uptimeNs) {
+    update(accelX, accelY, accelZ, angVelX, angVelY, angVelZ, magX, magY, magZ, uptimeNs, null);
+  }
+
+  void update(int accelX, int accelY, int accelZ, int angVelX, int angVelY, int angVelZ, int magX, int magY, int magZ, long uptimeNs, float[] gyroCalibrationRadiansPerSecond) {
     this.accelX = accelX;
     this.accelY = accelY;
     this.accelZ = accelZ;
@@ -26,6 +31,9 @@ public class ImuDataRaw {
     this.magY = magY;
     this.magZ = magZ;
     this.uptimeNs = uptimeNs;
+    if (gyroCalibrationRadiansPerSecond != null && gyroCalibrationRadiansPerSecond.length >= 3) {
+      System.arraycopy(gyroCalibrationRadiansPerSecond, 0, this.gyroCalibrationRadiansPerSecond, 0, 3);
+    }
   }
 
   void update(String other) {
@@ -59,6 +67,7 @@ public class ImuDataRaw {
     this.magZ = other.magZ;
     this.uptimeNs = other.uptimeNs;
     this._tmpOther = other._tmpOther;
+    System.arraycopy(other.gyroCalibrationRadiansPerSecond, 0, gyroCalibrationRadiansPerSecond, 0, 3);
   }
 
   // string every vector
@@ -84,9 +93,9 @@ public class ImuDataRaw {
 
   public float[] getGyroscopeRadiansPerSecond() {
     return new float[]{
-        -angVelX * GYRO_SCALE_RADIANS_PER_SECOND,
-        angVelZ * GYRO_SCALE_RADIANS_PER_SECOND,
-        angVelY * GYRO_SCALE_RADIANS_PER_SECOND
+        -angVelX * GYRO_SCALE_RADIANS_PER_SECOND + gyroCalibrationRadiansPerSecond[0],
+        angVelZ * GYRO_SCALE_RADIANS_PER_SECOND + gyroCalibrationRadiansPerSecond[1],
+        angVelY * GYRO_SCALE_RADIANS_PER_SECOND + gyroCalibrationRadiansPerSecond[2]
     };
   }
 

@@ -9,6 +9,12 @@ import android.util.Pair;
 
 import com.enricoros.nreal.driver.data.MagnetometerPreprocessor;
 
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
+import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.zip.CRC32;
 
@@ -26,6 +32,8 @@ class NrealDeviceThread extends Thread {
   private static final boolean DEBUG_10HZ = false;
   private static final boolean DEBUG_IMU_TEXT = false;
   private static final boolean DEBUG_OTHER_COMMANDS = false;
+  private static final int IMU_COMMAND_TIMEOUT_MS = 500;
+  private static final int MAX_FACTORY_CONFIG_BYTES = 128 * 1024;
 
   // constants from the datasheets
   private static final float TICK_SCALE_S = 1f / 1E9f;
@@ -42,6 +50,8 @@ class NrealDeviceThread extends Thread {
   private final byte[] otherData = new byte[64];
   private final ImuDataRaw imuDataRaw = new ImuDataRaw();
   private final MagnetometerPreprocessor magnetometerPreprocessor = new MagnetometerPreprocessor(100.f, 200);
+
+  private final float[] gyroCalibrationRadiansPerSecond = new float[3];
 
   private boolean mQuit = false;
 
@@ -103,6 +113,7 @@ class NrealDeviceThread extends Thread {
 
   @Override
   public void run() {
+    loadFactoryCalibration();
     if (!t_startImu()) {
       threadCallbacks.onConnectionError("Could not start reading the IMU");
       return;
@@ -172,7 +183,7 @@ class NrealDeviceThread extends Thread {
       printHex(imuData, 58, 6, "Unexpected IMU data (2): ");
 
     // call the callback
-    imuDataRaw.update(accelX, accelY, accelZ, angVelX, angVelY, angVelZ, magX, magY, magZ, uptimeNs);
+    imuDataRaw.update(accelX, accelY, accelZ, angVelX, angVelY, angVelZ, magX, magY, magZ, uptimeNs, gyroCalibrationRadiansPerSecond);
 
     // DATA PROCESSING
 
@@ -226,6 +237,96 @@ class NrealDeviceThread extends Thread {
       //mBrightness = btnValue;
     } else if (DEBUG_OTHER_COMMANDS)
       Log.e(TAG, "Read Other bytes: 22: " + btnIndex + ", 15: " + otherData[15] + ", 30: " + otherData[30] + ", 23: " + otherData[23] + " - " + Arrays.toString(otherData));
+  }
+
+  private void loadFactoryCalibration() {
+    try {
+      if (readFactoryGyroCalibration()) {
+        threadCallbacks.onMessage("Loaded factory IMU gyro calibration");
+      }
+    } catch (RuntimeException e) {
+      Log.w(TAG, "Could not load factory IMU calibration", e);
+    }
+  }
+
+  private boolean readFactoryGyroCalibration() {
+    // Pause the IMU stream while asking the glasses for their JSON calibration blob.
+    t_sendImuCommand(0x19, new byte[]{0x00}, IMU_COMMAND_TIMEOUT_MS);
+
+    byte[] lengthBytes = t_sendImuCommand(0x14, new byte[0], IMU_COMMAND_TIMEOUT_MS);
+    if (lengthBytes == null || lengthBytes.length < 4) {
+      return false;
+    }
+
+    int configLength = readLe32(lengthBytes, 0);
+    if (configLength <= 0 || configLength > MAX_FACTORY_CONFIG_BYTES) {
+      return false;
+    }
+
+    ByteArrayOutputStream configBytes = new ByteArrayOutputStream(configLength);
+    while (configBytes.size() < configLength) {
+      byte[] chunk = t_sendImuCommand(0x15, new byte[0], IMU_COMMAND_TIMEOUT_MS);
+      if (chunk == null || chunk.length == 0) {
+        return false;
+      }
+      int bytesToWrite = Math.min(chunk.length, configLength - configBytes.size());
+      configBytes.write(chunk, 0, bytesToWrite);
+    }
+
+    return parseFactoryGyroCalibration(new String(configBytes.toByteArray(), StandardCharsets.UTF_8));
+  }
+
+  private boolean parseFactoryGyroCalibration(String configJson) {
+    try {
+      JSONObject config = new JSONObject(configJson);
+      JSONObject imuDevice = config.getJSONObject("IMU").getJSONObject("device_1");
+      JSONArray gyroBias = imuDevice.getJSONArray("gyro_bias");
+      if (gyroBias.length() < 3) {
+        return false;
+      }
+
+      // Match the axis/sign convention used by getGyroscopeRadiansPerSecond().
+      gyroCalibrationRadiansPerSecond[0] = -(float) gyroBias.getDouble(0);
+      gyroCalibrationRadiansPerSecond[1] = (float) gyroBias.getDouble(1);
+      gyroCalibrationRadiansPerSecond[2] = (float) gyroBias.getDouble(2);
+      return true;
+    } catch (JSONException e) {
+      Log.w(TAG, "Could not parse factory IMU calibration", e);
+      return false;
+    }
+  }
+
+  private byte[] t_sendImuCommand(int commandId, byte[] data, int timeoutMs) {
+    int length = data.length + 3;
+    byte[] packet = new byte[8 + data.length];
+    packet[0] = (byte) 0xAA;
+    putLe16(packet, 5, length);
+    packet[7] = (byte) (commandId & 0xFF);
+    System.arraycopy(data, 0, packet, 8, data.length);
+
+    CRC32 crc32 = new CRC32();
+    crc32.update(packet, 5, length);
+    putLe32(packet, 1, (int) crc32.getValue());
+
+    int sent = connection.bulkTransfer(imuOut, packet, packet.length, timeoutMs);
+    if (sent != packet.length) {
+      return null;
+    }
+
+    for (int attempt = 0; attempt < 8; attempt++) {
+      byte[] response = new byte[64];
+      int received = connection.bulkTransfer(imuIn, response, response.length, timeoutMs);
+      if (received <= 0) {
+        return null;
+      }
+      if (received < 8 || response[0] != (byte) 0xAA || (response[7] & 0xFF) != (commandId & 0xFF)) {
+        continue;
+      }
+      int responseLength = readLe16(response, 5);
+      int responseDataLength = Math.max(0, Math.min(received - 8, responseLength - 3));
+      return Arrays.copyOfRange(response, 8, 8 + responseDataLength);
+    }
+    return null;
   }
 
   private boolean t_startImu() {
@@ -291,6 +392,13 @@ class NrealDeviceThread extends Thread {
 
   private static int readLe16(byte[] source, int offset) {
     return (source[offset] & 0xFF) | ((source[offset + 1] & 0xFF) << 8);
+  }
+
+  private static int readLe32(byte[] source, int offset) {
+    return (source[offset] & 0xFF)
+        | ((source[offset + 1] & 0xFF) << 8)
+        | ((source[offset + 2] & 0xFF) << 16)
+        | ((source[offset + 3] & 0xFF) << 24);
   }
 
   private static void putLe32(byte[] target, int offset, int value) {
