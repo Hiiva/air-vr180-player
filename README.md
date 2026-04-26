@@ -1,56 +1,155 @@
-# Android-Nreal 🕶️📱
+# Air VR180 Player
 
-Welcome to the Android-Nreal project! 🎉👋 This open-source Android library is designed to
-communicate with Nreal Air AR glasses. Our goal is to provide a convenient,
-efficient, easy to understand, and dependency-free library for developers to create AR
-experiences on the Nreal platform.
+Air VR180 Player is an Android app for watching VR180 side-by-side videos on
+Nreal/Xreal Air glasses. The phone app handles video selection and playback
+controls, while the glasses are used as the external display. USB IMU data from
+the glasses drives 3DoF head tracking for the rendered VR view.
 
-## 🌟 Features
+This repository also contains the low-level Android USB driver code used to
+discover the glasses, request permission, read HID packets, decode IMU/button
+events, and feed tracking data into the player.
 
-- [x] Auto-detection and hot-plug detection
-- [x] Communication and IMU packet decode
-- [x] Key press decoding (brightness up/down, power)
-- [ ] Sensor fusion
-  - [x] Magnetometer calibration
-  - [ ] Good AHRS algorithm
-- [ ] Rendering
-- [ ] [Nreal Light](https://www.nreal.ai/light/) support
-- [ ] Per-eye display (3D spatial rendering for your Java/OpenGL apps)
-- [ ] Standalone library with demos
+<img src="docs/Screenshot_20260426_000116_Air%20VR180%20Player.png" alt="Air VR180 Player screenshot" width="420" />
 
-We're far from done, and your pull requests would be greatly appreciated! 🤝
+## Features
 
-## 📚 What is this?
+- Select local videos through Android's system file picker.
+- Play VR180 side-by-side video through Media3 ExoPlayer.
+- Render the VR view with OpenGL ES using an external video texture.
+- Prefer an attached Nreal/Xreal Air display for presentation output.
+- Automatically switch to side-by-side stereo output on wide external displays.
+- Read Nreal Air USB HID IMU packets for 3DoF head tracking.
+- Recenter tracking from the app UI.
+- Adjust view scale, scene center, and horizon offset.
+- Use playback controls for play/pause, +/-10 second seek, and A-B loop.
+- Remember recent videos and playback positions.
+- Toggle dark mode and mute audio.
+- Show diagnostics for USB connection, external display, tracking, and playback.
 
-The library aims to discover, open, read, and decode the IMU messages from Nreal Air AR glasses. It
-provides easy-to-use 3DoF coordinates for viewport rendering. In the future, we plan to support
-dual-eye rendering, 6DoF, and camera/microphone input. If this project pushes Nreal to broaden
-the SDK to the Android platform, that would also be a huge win for the community!
+## Current Status
 
-<img src="docs/screenshot_test_app_landscape_vector.png" alt="Screenshot" width="800" />
+This is a working experimental app, not a polished SDK.
 
-## 🚀 How to Build and Run
+Supported and actively used:
 
-You can easily build and run this project on your own unrooted Android devices. Here are the steps:
+- Nreal Air USB device ID `3318:0424`
+- Android USB host access
+- External display presentation
+- 3DoF IMU-driven VR180 viewing
 
-1. Clone the repository: `git clone https://github.com/enricoros/android-nreal.git`
-2. Open the project with Android Studio 2022.3.1 or later.
-3. Connect your Android device to your computer (targeting API 30, but it can be easily relaxed)
-4. Click the "Run" button (▶️) in Android Studio
+Not yet implemented or incomplete:
 
-## 🙌 Special Thanks
+- Nreal Light support
+- 6DoF tracking
+- Camera or microphone access
+- A packaged standalone library API
+- Broad device compatibility testing
 
-We would like to thank the following members of the Nreal Community Discord for their initial code
-and help:
+## Requirements
 
-- ***@edwatt*** - Github: [edwatt/imu-inspector](https://github.com/edwatt/imu-inspector)
-- ***@MattXer*** - Github: [MSmithDev/AirAPI_Windows](https://github.com/MSmithDev/AirAPI_Windows)
-- ***@Noot*** - Github: [abls/imu-inspector](https://github.com/abls/imu-inspector)
+- Android Studio with Android Gradle Plugin 9.2.0 support.
+- JDK compatible with the Android Gradle Plugin version in this repo.
+- Android SDK 36 installed.
+- Android device running Android 11 / API 30 or newer.
+- USB host capable Android device.
+- Nreal Air or compatible Xreal Air glasses.
+- A USB-C setup that exposes both the display output and the USB HID interface
+  to the phone.
 
-Thank you for your invaluable contributions! 🏆
+## Build
 
-## 💡 Contributing
+Clone the repository:
 
-If you're interested in contributing to this project, please clone, fork, slash, and burn the code,
-and then send me a pull request! By working together, we can create a more comprehensive and robust
-library for the Nreal developer community 🚀🌟
+```bash
+git clone https://github.com/hiiva/android-nreal.git
+cd android-nreal
+```
+
+Build a debug APK:
+
+```bash
+./gradlew assembleDebug
+```
+
+On Windows PowerShell:
+
+```powershell
+.\gradlew.bat assembleDebug
+```
+
+The debug APK is generated under:
+
+```text
+app/build/outputs/apk/debug/
+```
+
+## Run
+
+1. Connect the glasses to the Android device.
+2. Install and open the app from Android Studio, or install the debug APK.
+3. Grant the USB permission prompt when Android asks for access to the glasses.
+4. Tap `Select` and choose a local VR180 video.
+5. Use `Recenter` after putting the glasses on.
+6. Adjust `View scale`, `Scene center`, and `Horizon` if the projection needs
+   alignment.
+
+The phone screen remains the controller. The VR video is presented on the
+external glasses display when Android exposes it as a presentation display.
+
+## Project Layout
+
+```text
+app/src/main/java/com/enricoros/nreal/
+  MainActivity.java              App UI, playback, external display routing
+  VectorDisplayView.java         Diagnostic/vector display view
+
+app/src/main/java/com/enricoros/nreal/player/
+  Vr180Renderer.java             OpenGL ES VR180 renderer
+  VrVideoSurfaceView.java        GLSurfaceView wrapper
+  VrPlayerPresentation.java      External display presentation
+  HeadTracker.java               3DoF tracking integration
+  Quaternion.java                Rotation math
+  RecentVideo*.java              Recent video persistence
+
+app/src/main/java/com/enricoros/nreal/driver/
+  NrealManager.java              USB connection lifecycle
+  NrealDeviceThread.java         HID reader thread
+  ImuDataRaw.java                Raw IMU packet model
+  UsbUtils.java                  USB discovery helpers
+  data/MagnetometerPreprocessor.java
+```
+
+## Implementation Notes
+
+- Video playback uses `androidx.media3:media3-exoplayer`.
+- The renderer consumes a `SurfaceTexture` backed by an
+  `GL_TEXTURE_EXTERNAL_OES` texture.
+- A display is treated as stereo when it is very wide, currently `width >= 3000`
+  or aspect ratio `>= 2.4`.
+- USB device matching is declared in `app/src/main/res/xml/device_filter.xml`.
+- Viewer settings are stored in Android shared preferences.
+
+## Troubleshooting
+
+- `No attached Nreal devices found`: check that the USB data path is connected,
+  not only display output.
+- `USB permission denied`: unplug/replug the glasses and grant the Android USB
+  permission dialog.
+- `Output: no external Air display`: Android is not exposing the glasses as an
+  external presentation display.
+- Tracking is stale or unavailable: confirm the app has USB permission and the
+  diagnostics line says the IMU is streaming.
+- Video opens but looks wrong: confirm the source is VR180 side-by-side video.
+
+## Credits
+
+Thanks to members of the Nreal community whose early work and notes helped make
+the USB/IMU side possible:
+
+- edwatt: https://github.com/edwatt/imu-inspector
+- MattXer: https://github.com/MSmithDev/AirAPI_Windows
+- Noot: https://github.com/abls/imu-inspector
+
+## License
+
+See [LICENSE](LICENSE).
