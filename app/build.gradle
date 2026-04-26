@@ -3,29 +3,29 @@ plugins {
 }
 
 android {
-    namespace 'com.enricoros.nreal'
-    compileSdk 33
+    namespace = 'com.enricoros.nreal'
+    compileSdk = 36
 
     defaultConfig {
-        applicationId "com.enricoros.nreal"
-        minSdk 30
-        targetSdk 33
-        versionCode 1
-        versionName "1.0"
+        applicationId = "com.enricoros.nreal"
+        minSdk = 30
+        targetSdk = 33
+        versionCode = 1
+        versionName = "1.0"
     }
 
     buildTypes {
         release {
-            minifyEnabled false
+            minifyEnabled = false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
     buildFeatures {
-        viewBinding true
+        viewBinding = true
     }
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_1_8
-        targetCompatibility JavaVersion.VERSION_1_8
+        sourceCompatibility = JavaVersion.VERSION_1_8
+        targetCompatibility = JavaVersion.VERSION_1_8
     }
 }
 
@@ -33,6 +33,7 @@ dependencies {
 
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+    implementation 'androidx.media3:media3-exoplayer:1.10.0'
     implementation 'androidx.preference:preference:1.2.0'
     implementation 'com.google.android.material:material:1.8.0'
 }

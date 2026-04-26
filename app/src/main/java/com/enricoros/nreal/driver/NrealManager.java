@@ -12,6 +12,7 @@ import android.hardware.usb.UsbDeviceConnection;
 import android.hardware.usb.UsbEndpoint;
 import android.hardware.usb.UsbInterface;
 import android.hardware.usb.UsbManager;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
@@ -38,6 +39,7 @@ public class NrealManager {
   private final Listener listener;
   private final UsbManager usbManager;
   private final SharedPreferences preferences;
+  private final BroadcastReceiver mUsbPermissionReceiver;
 
   private UsbDeviceConnection mDeviceConnection;
   private NrealDeviceThread mThread;
@@ -67,7 +69,7 @@ public class NrealManager {
     preferences = PreferenceManager.getDefaultSharedPreferences(context);
 
     // Note: moved registration here to be sure we will not double-register this receiver
-    BroadcastReceiver mUsbPermissionReceiver = new BroadcastReceiver() {
+    mUsbPermissionReceiver = new BroadcastReceiver() {
       @Override
       public void onReceive(Context context, Intent intent) {
         if (!Objects.equals(intent.getAction(), CUSTOM_BROADCAST_PERMISSION_ACTION))
@@ -76,7 +78,7 @@ public class NrealManager {
           listener.onPermissionDenied();
           return;
         }
-        UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+        UsbDevice device = getUsbDeviceExtra(intent);
         if (device == null) {
           listener.onConnectionError("No permission granted for device");
           return;
@@ -87,8 +89,11 @@ public class NrealManager {
       }
     };
 
-    // @noinspection UnspecifiedRegisterReceiverFlag
-    context.registerReceiver(mUsbPermissionReceiver, new IntentFilter(CUSTOM_BROADCAST_PERMISSION_ACTION));
+    IntentFilter usbPermissionFilter = new IntentFilter(CUSTOM_BROADCAST_PERMISSION_ACTION);
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+      context.registerReceiver(mUsbPermissionReceiver, usbPermissionFilter, Context.RECEIVER_NOT_EXPORTED);
+    else
+      context.registerReceiver(mUsbPermissionReceiver, usbPermissionFilter);
   }
 
 
@@ -123,6 +128,15 @@ public class NrealManager {
 
   public boolean isDeviceStreaming() {
     return mThread != null && mThread.isAlive();
+  }
+
+  public void destroy() {
+    closeNrealUsbDevice();
+    try {
+      context.unregisterReceiver(mUsbPermissionReceiver);
+    } catch (IllegalArgumentException ignored) {
+      // Receiver was already unregistered.
+    }
   }
 
 
@@ -205,6 +219,11 @@ public class NrealManager {
     public void onButtonPressedTemp(int button, int value) {
       uiHandler.post(() -> listener.onButtonPressedTemp(button, value));
     }
+
+    @Override
+    public void onMessage(String message) {
+      uiHandler.post(() -> listener.onMessage(message));
+    }
   };
 
   private void stopNrealCommunication() {
@@ -213,6 +232,13 @@ public class NrealManager {
       mThread.saveState(preferences);
       mThread = null;
     }
+  }
+
+  @SuppressWarnings("deprecation")
+  private static UsbDevice getUsbDeviceExtra(Intent intent) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+      return intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice.class);
+    return intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
   }
 
 }

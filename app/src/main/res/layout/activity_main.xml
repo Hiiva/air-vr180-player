@@ -1,81 +1,353 @@
 <?xml version="1.0" encoding="utf-8"?>
-<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
+    android:background="@color/panel"
+    android:orientation="vertical"
     tools:context=".MainActivity">
 
-  <!-- centered text -->
-  <TextView
-      android:id="@+id/welcomeTextView"
+  <LinearLayout
       android:layout_width="match_parent"
       android:layout_height="wrap_content"
-      android:paddingVertical="16dp"
-      android:text="@string/title_name"
-      android:textAlignment="center"
-      android:textColor="?attr/colorPrimary"
-      android:textSize="24sp"
-      app:layout_constraintBottom_toTopOf="@+id/statusTextTitle"
-      app:layout_constraintTop_toTopOf="parent" />
-
-  <TextView
-      android:id="@+id/statusTextTitle"
-      android:layout_width="match_parent"
-      android:layout_height="wrap_content"
-      android:background="?attr/colorPrimaryVariant"
-      android:padding="16dp"
-      android:text="@string/status_title"
-      android:textColor="?attr/colorOnPrimary"
-      android:textSize="18sp"
-      android:textStyle="bold"
-      app:layout_constraintBottom_toTopOf="@+id/statusTextContent"
-      app:layout_constraintTop_toBottomOf="@+id/welcomeTextView" />
-
-  <!-- Status view: shows the current status -->
-  <TextView
-      android:id="@+id/statusTextContent"
-      android:layout_width="match_parent"
-      android:layout_height="wrap_content"
-      android:background="?attr/colorPrimaryVariant"
-      android:fontFamily="monospace"
-      android:minHeight="300dp"
+      android:background="@color/primary_dark"
+      android:gravity="center_vertical"
+      android:orientation="horizontal"
       android:paddingHorizontal="16dp"
-      android:paddingBottom="16dp"
-      android:textColor="?attr/colorOnPrimary"
-      android:textSize="16sp"
-      android:textStyle="bold"
-      app:layout_constraintBottom_toTopOf="@+id/scrollView"
-      app:layout_constraintTop_toBottomOf="@+id/statusTextTitle"
-      tools:text="Status\nwill\nappear\nhere" />
-
-  <!-- Shows Vector(s) -->
-  <com.enricoros.nreal.VectorDisplayView
-      android:id="@+id/vectorDisplayView"
-      android:layout_width="match_parent"
-      android:layout_height="0dp"
-      app:layout_constraintBottom_toBottomOf="@id/scrollView"
-      app:layout_constraintEnd_toEndOf="parent"
-      app:layout_constraintStart_toStartOf="parent"
-      app:layout_constraintTop_toTopOf="@id/scrollView" />
-
-  <!-- Log view: shows the log messages -->
-  <ScrollView
-      android:id="@+id/scrollView"
-      android:layout_width="match_parent"
-      android:layout_height="0dp"
-      app:layout_constraintBottom_toBottomOf="parent"
-      app:layout_constraintTop_toBottomOf="@+id/statusTextContent">
+      android:paddingVertical="12dp">
 
     <TextView
-        android:id="@+id/logTextView"
+        android:id="@+id/titleTextView"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:text="@string/title_name"
+        android:textColor="@color/white"
+        android:textSize="20sp"
+        android:textStyle="bold" />
+
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/selectVideoButton"
+        android:layout_width="wrap_content"
+        android:layout_height="48dp"
+        android:minWidth="0dp"
+        android:text="Select"
+        app:icon="@drawable/ic_folder_open_24"
+        app:iconGravity="textStart" />
+
+  </LinearLayout>
+
+  <ScrollView
+      android:layout_width="match_parent"
+      android:layout_height="0dp"
+      android:layout_weight="1"
+      android:fillViewport="true">
+
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:padding="16dp"
-        android:textColor="?attr/colorPrimaryVariant"
-        android:textSize="14sp"
-        tools:text="Log messages will appear here." />
+        android:orientation="vertical"
+        android:padding="16dp">
 
+      <TextView
+          android:id="@+id/currentVideoTitle"
+          android:layout_width="match_parent"
+          android:layout_height="wrap_content"
+          android:text="No video selected"
+          android:textColor="@color/ink"
+          android:textSize="22sp"
+          android:textStyle="bold" />
+
+      <TextView
+          android:id="@+id/playbackStatusText"
+          android:layout_width="match_parent"
+          android:layout_height="wrap_content"
+          android:layout_marginTop="6dp"
+          android:text="Idle"
+          android:textColor="@color/muted"
+          android:textSize="14sp" />
+
+      <SeekBar
+          android:id="@+id/progressSeekBar"
+          android:layout_width="match_parent"
+          android:layout_height="48dp"
+          android:layout_marginTop="16dp"
+          android:max="1000" />
+
+      <TextView
+          android:id="@+id/positionText"
+          android:layout_width="match_parent"
+          android:layout_height="wrap_content"
+          android:text="00:00 / 00:00"
+          android:textAlignment="center"
+          android:textColor="@color/muted"
+          android:textSize="13sp" />
+
+      <LinearLayout
+          android:layout_width="match_parent"
+          android:layout_height="wrap_content"
+          android:layout_marginTop="12dp"
+          android:gravity="center"
+          android:orientation="horizontal">
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/rewindButton"
+            android:layout_width="0dp"
+            android:layout_height="52dp"
+            android:layout_marginEnd="8dp"
+            android:layout_weight="1"
+            android:minWidth="0dp"
+            android:text="-10"
+            app:icon="@drawable/ic_replay_10_24"
+            app:iconGravity="textStart" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/playPauseButton"
+            android:layout_width="0dp"
+            android:layout_height="52dp"
+            android:layout_marginHorizontal="4dp"
+            android:layout_weight="1.35"
+            android:minWidth="0dp"
+            android:text="Play"
+            app:icon="@drawable/ic_play_arrow_24"
+            app:iconGravity="textStart" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/forwardButton"
+            android:layout_width="0dp"
+            android:layout_height="52dp"
+            android:layout_marginStart="8dp"
+            android:layout_weight="1"
+            android:minWidth="0dp"
+            android:text="+10"
+            app:icon="@drawable/ic_forward_10_24"
+            app:iconGravity="textStart" />
+
+      </LinearLayout>
+
+      <com.google.android.material.button.MaterialButton
+          android:id="@+id/abLoopButton"
+          android:layout_width="match_parent"
+          android:layout_height="48dp"
+          android:layout_marginTop="8dp"
+          android:minWidth="0dp"
+          android:text="Set loop A" />
+
+      <com.google.android.material.button.MaterialButton
+          android:id="@+id/recenterButton"
+          android:layout_width="match_parent"
+          android:layout_height="52dp"
+          android:layout_marginTop="8dp"
+          android:text="Recenter"
+          app:icon="@drawable/ic_center_focus_24"
+          app:iconGravity="textStart" />
+
+      <View
+          android:layout_width="match_parent"
+          android:layout_height="1dp"
+          android:layout_marginVertical="18dp"
+          android:background="@color/panel_alt" />
+
+      <LinearLayout
+          android:layout_width="match_parent"
+          android:layout_height="wrap_content"
+          android:gravity="center_vertical"
+          android:orientation="horizontal">
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="View scale"
+            android:textColor="@color/ink"
+            android:textSize="15sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/viewScaleValue"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="1.00x"
+            android:textColor="@color/muted"
+            android:textSize="14sp" />
+
+      </LinearLayout>
+
+      <com.google.android.material.slider.Slider
+          android:id="@+id/viewScaleSlider"
+          android:layout_width="match_parent"
+          android:layout_height="wrap_content" />
+
+      <LinearLayout
+          android:layout_width="match_parent"
+          android:layout_height="wrap_content"
+          android:layout_marginTop="12dp"
+          android:gravity="center_vertical"
+          android:orientation="horizontal">
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Scene center"
+            android:textColor="@color/ink"
+            android:textSize="15sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/sceneCenterValue"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="0 deg"
+            android:textColor="@color/muted"
+            android:textSize="14sp" />
+
+      </LinearLayout>
+
+      <com.google.android.material.slider.Slider
+          android:id="@+id/sceneCenterSlider"
+          android:layout_width="match_parent"
+          android:layout_height="wrap_content" />
+
+      <LinearLayout
+          android:layout_width="match_parent"
+          android:layout_height="wrap_content"
+          android:layout_marginTop="12dp"
+          android:gravity="center_vertical"
+          android:orientation="horizontal">
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Horizon"
+            android:textColor="@color/ink"
+            android:textSize="15sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/horizonValue"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="0 deg"
+            android:textColor="@color/muted"
+            android:textSize="14sp" />
+
+      </LinearLayout>
+
+      <com.google.android.material.slider.Slider
+          android:id="@+id/horizonSlider"
+          android:layout_width="match_parent"
+          android:layout_height="wrap_content" />
+
+      <com.google.android.material.button.MaterialButton
+          android:id="@+id/resetViewPositionButton"
+          android:layout_width="match_parent"
+          android:layout_height="52dp"
+          android:layout_marginTop="8dp"
+          android:text="Reset view position"
+          app:icon="@drawable/ic_center_focus_24"
+          app:iconGravity="textStart" />
+
+      <View
+          android:layout_width="match_parent"
+          android:layout_height="1dp"
+          android:layout_marginVertical="18dp"
+          android:background="@color/panel_alt" />
+
+      <TextView
+          android:layout_width="match_parent"
+          android:layout_height="wrap_content"
+          android:text="Recent videos"
+          android:textColor="@color/ink"
+          android:textSize="18sp"
+          android:textStyle="bold" />
+
+      <LinearLayout
+          android:id="@+id/recentVideosContainer"
+          android:layout_width="match_parent"
+          android:layout_height="wrap_content"
+          android:layout_marginTop="8dp"
+          android:orientation="vertical" />
+
+      <View
+          android:layout_width="match_parent"
+          android:layout_height="1dp"
+          android:layout_marginVertical="18dp"
+          android:background="@color/panel_alt" />
+
+      <TextView
+          android:layout_width="match_parent"
+          android:layout_height="wrap_content"
+          android:text="Settings"
+          android:textColor="@color/ink"
+          android:textSize="18sp"
+          android:textStyle="bold" />
+
+      <com.google.android.material.switchmaterial.SwitchMaterial
+          android:id="@+id/darkModeSwitch"
+          android:layout_width="match_parent"
+          android:layout_height="48dp"
+          android:layout_marginTop="8dp"
+          android:text="Dark mode"
+          android:textColor="@color/ink"
+          android:textSize="15sp"
+          android:textStyle="bold" />
+
+      <com.google.android.material.switchmaterial.SwitchMaterial
+          android:id="@+id/muteAudioSwitch"
+          android:layout_width="match_parent"
+          android:layout_height="48dp"
+          android:text="Mute audio"
+          android:textColor="@color/ink"
+          android:textSize="15sp"
+          android:textStyle="bold" />
+
+      <com.google.android.material.button.MaterialButton
+          android:id="@+id/clearRecentVideosButton"
+          style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+          android:layout_width="match_parent"
+          android:layout_height="48dp"
+          android:layout_marginTop="8dp"
+          android:text="Clear recent videos" />
+
+      <TextView
+          android:layout_width="match_parent"
+          android:layout_height="wrap_content"
+          android:layout_marginTop="12dp"
+          android:text="Diagnostics"
+          android:textColor="@color/ink"
+          android:textSize="18sp"
+          android:textStyle="bold" />
+
+      <TextView
+          android:id="@+id/glassesStatusText"
+          android:layout_width="match_parent"
+          android:layout_height="wrap_content"
+          android:layout_marginTop="8dp"
+          android:text="Glasses: disconnected"
+          android:textColor="@color/ink"
+          android:textSize="15sp" />
+
+      <TextView
+          android:id="@+id/outputStatusText"
+          android:layout_width="match_parent"
+          android:layout_height="wrap_content"
+          android:layout_marginTop="6dp"
+          android:text="Output: no external display"
+          android:textColor="@color/ink"
+          android:textSize="15sp" />
+
+      <TextView
+          android:id="@+id/trackingStatusText"
+          android:layout_width="match_parent"
+          android:layout_height="wrap_content"
+          android:layout_marginTop="6dp"
+          android:text="Tracking: waiting for IMU"
+          android:textColor="@color/ink"
+          android:textSize="15sp" />
+
+    </LinearLayout>
   </ScrollView>
-
-</androidx.constraintlayout.widget.ConstraintLayout>
+</LinearLayout>

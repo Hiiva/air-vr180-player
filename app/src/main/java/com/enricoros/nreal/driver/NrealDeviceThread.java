@@ -10,6 +10,7 @@ import android.util.Pair;
 import com.enricoros.nreal.driver.data.MagnetometerPreprocessor;
 
 import java.util.Arrays;
+import java.util.zip.CRC32;
 
 /**
  * Implements communication with the device and decoding of the data.
@@ -23,6 +24,7 @@ class NrealDeviceThread extends Thread {
 
   private static final String TAG = "NrealDeviceThread";
   private static final boolean DEBUG_10HZ = false;
+  private static final boolean DEBUG_IMU_TEXT = false;
   private static final boolean DEBUG_OTHER_COMMANDS = false;
 
   // constants from the datasheets
@@ -34,6 +36,7 @@ class NrealDeviceThread extends Thread {
   private final UsbEndpoint imuIn;
   private final UsbEndpoint imuOut;
   private final UsbEndpoint otherIn;
+  private final UsbEndpoint otherOut;
   private final ThreadCallbacks threadCallbacks;
   private final byte[] imuData = new byte[64];
   private final byte[] otherData = new byte[64];
@@ -54,6 +57,8 @@ class NrealDeviceThread extends Thread {
     void onNewData(ImuDataRaw data);
 
     void onButtonPressedTemp(int button, int value);
+
+    void onMessage(String message);
   }
 
 
@@ -62,6 +67,7 @@ class NrealDeviceThread extends Thread {
     imuIn = imuEndpoints.first;
     imuOut = imuEndpoints.second;
     otherIn = otherEndpoints.first;
+    otherOut = otherEndpoints.second;
     threadCallbacks = callbacks;
   }
 
@@ -104,6 +110,11 @@ class NrealDeviceThread extends Thread {
     if (!t_startOther()) {
       threadCallbacks.onConnectionError("Could not start reading the Others");
       return;
+    }
+    if (t_setDisplayModeStereo()) {
+      threadCallbacks.onMessage("Requested Nreal Air SBS stereo display mode");
+    } else {
+      threadCallbacks.onMessage("Could not switch Nreal Air to SBS stereo display mode");
     }
 
     lastUptimeNs = 0;
@@ -182,9 +193,11 @@ class NrealDeviceThread extends Thread {
     float aZ = (float) (accelZ) * ACCEL_SCALE_G;
     float[] mag = magnetometerPreprocessor.process(new int[]{magX, magY, magZ}, dT);
 
-    // convert dRoll to string with 2 decimal places
-    imuDataRaw.update(String.format("\n\nGyro (dps):  %+,.1f  %+,.1f  %+,.1f\n\nAcc    (G):  %+,.1f  %+,.1f  %+,.1f\n\nMag (norm):  %.3f  %.3f  %.3f\n\ndT (ms):  %3.0f",
-        dRoll, dPitch, dYaw, aX, aY, aZ, mag[0], mag[1], mag[2], dT * 1000));
+    if (DEBUG_IMU_TEXT) {
+      // convert dRoll to string with 2 decimal places
+      imuDataRaw.update(String.format("\n\nGyro (dps):  %+,.1f  %+,.1f  %+,.1f\n\nAcc    (G):  %+,.1f  %+,.1f  %+,.1f\n\nMag (norm):  %.3f  %.3f  %.3f\n\ndT (ms):  %3.0f",
+          dRoll, dPitch, dYaw, aX, aY, aZ, mag[0], mag[1], mag[2], dT * 1000));
+    }
     threadCallbacks.onNewData(imuDataRaw);
   }
 
@@ -227,6 +240,64 @@ class NrealDeviceThread extends Thread {
     // NOTE: doesn't seem to work now - commented out
     // magicPayload to retrieve brightness = {(byte) 0xfd, 0x1e, (byte) 0xb9, (byte) 0xf0, 0x68, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03};
     return true;
+  }
+
+  private boolean t_setDisplayModeStereo() {
+    // Nreal Air MCU command 0x08 selects display mode. Mode 3 is full SBS,
+    // where the external display becomes 3840x1080 with one 1920x1080 half per eye.
+    return t_sendMcuCommand(0x08, new byte[]{0x03});
+  }
+
+  private boolean t_sendMcuCommand(int commandId, byte[] data) {
+    if (data.length > 42)
+      throw new IllegalArgumentException("Nreal MCU command data too long");
+
+    byte[] packet = new byte[64];
+    packet[0] = (byte) 0xFD;
+    int length = data.length + 17;
+    putLe16(packet, 5, length);
+    putLe32(packet, 7, 0x1337);
+    putLe32(packet, 11, 0);
+    putLe16(packet, 15, commandId);
+    System.arraycopy(data, 0, packet, 22, data.length);
+
+    CRC32 crc32 = new CRC32();
+    crc32.update(packet, 5, length);
+    putLe32(packet, 1, (int) crc32.getValue());
+
+    int sent = connection.bulkTransfer(otherOut, packet, packet.length, 500);
+    if (sent != packet.length) {
+      Log.e(TAG, "Could not write MCU command " + commandId + ", sent=" + sent);
+      return false;
+    }
+
+    byte[] response = new byte[64];
+    int received = connection.bulkTransfer(otherIn, response, response.length, 500);
+    if (received <= 0) {
+      // Some firmware revisions apply the mode switch without returning a response.
+      return true;
+    }
+    if (response[0] != (byte) 0xFD || readLe16(response, 15) != commandId) {
+      return true;
+    }
+    int dataLength = Math.max(0, readLe16(response, 5) - 17);
+    return dataLength == 0 || response[22] == 0;
+  }
+
+  private static void putLe16(byte[] target, int offset, int value) {
+    target[offset] = (byte) (value & 0xFF);
+    target[offset + 1] = (byte) ((value >> 8) & 0xFF);
+  }
+
+  private static int readLe16(byte[] source, int offset) {
+    return (source[offset] & 0xFF) | ((source[offset + 1] & 0xFF) << 8);
+  }
+
+  private static void putLe32(byte[] target, int offset, int value) {
+    target[offset] = (byte) (value & 0xFF);
+    target[offset + 1] = (byte) ((value >> 8) & 0xFF);
+    target[offset + 2] = (byte) ((value >> 16) & 0xFF);
+    target[offset + 3] = (byte) ((value >> 24) & 0xFF);
   }
 
   private void printHex(byte[] data, int from, int count, String prefix) {

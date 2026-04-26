@@ -6,6 +6,9 @@ import android.annotation.SuppressLint;
 import androidx.annotation.NonNull;
 
 public class ImuDataRaw {
+  private static final float GYRO_SCALE_RADIANS_PER_SECOND = (float) Math.toRadians(2000f / 8388608f);
+  private static final float ACCEL_SCALE_G = 16f / 8388608f;
+
   int accelX, accelY, accelZ;
   int angVelX, angVelY, angVelZ;
   int magX, magY, magZ;
@@ -69,5 +72,25 @@ public class ImuDataRaw {
 
   public float[] getAcceleration() {
     return new float[]{(float) accelX, (float) accelY, (float) accelZ};
+  }
+
+  public float[] getAccelerationGs() {
+    return new float[]{
+        -accelX * ACCEL_SCALE_G,
+        accelZ * ACCEL_SCALE_G,
+        accelY * ACCEL_SCALE_G
+    };
+  }
+
+  public float[] getGyroscopeRadiansPerSecond() {
+    return new float[]{
+        -angVelX * GYRO_SCALE_RADIANS_PER_SECOND,
+        angVelZ * GYRO_SCALE_RADIANS_PER_SECOND,
+        angVelY * GYRO_SCALE_RADIANS_PER_SECOND
+    };
+  }
+
+  public long getUptimeNs() {
+    return uptimeNs;
   }
 }
