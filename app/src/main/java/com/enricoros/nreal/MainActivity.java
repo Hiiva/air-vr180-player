@@ -881,8 +881,21 @@ public class MainActivity extends AppCompatActivity {
       LinearLayout.LayoutParams buttonParams = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(48));
       buttonParams.setMargins(dp(10), 0, 0, 0);
 
+      MaterialButton removeButton = new MaterialButton(this);
+      removeButton.setText("");
+      removeButton.setIconResource(R.drawable.ic_delete_24);
+      removeButton.setIconPadding(0);
+      removeButton.setMinWidth(0);
+      removeButton.setMinimumWidth(0);
+      removeButton.setPadding(0, 0, 0, 0);
+      removeButton.setContentDescription("Remove " + video.title + " from recent videos");
+      removeButton.setOnClickListener(v -> removeRecentVideo(video));
+      LinearLayout.LayoutParams removeButtonParams = new LinearLayout.LayoutParams(dp(30), dp(48));
+      removeButtonParams.setMargins(dp(6), 0, 0, 0);
+
       row.addView(textColumn);
       row.addView(playButton, buttonParams);
+      row.addView(removeButton, removeButtonParams);
       binding.recentVideosContainer.addView(row);
     }
   }
