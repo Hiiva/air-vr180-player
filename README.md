@@ -10,7 +10,7 @@ tracking in the VR180 renderer.
 The repository also includes an optional FastAPI server for browsing and
 streaming a local VR180 video library over a trusted home network.
 
-![Air VR180 Player screenshot](docs/Screenshot.png)
+<img src="docs/Screenshot.png" alt="Air VR180 Player screenshot" width="420">
 
 ## Current Scope
 
