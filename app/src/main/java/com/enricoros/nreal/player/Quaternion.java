@@ -31,12 +31,11 @@ final class Quaternion {
     z = other.z;
   }
 
-  Quaternion copy() {
-    return new Quaternion(w, x, y, z);
-  }
-
-  Quaternion conjugated() {
-    return new Quaternion(w, -x, -y, -z);
+  void setConjugated(Quaternion other) {
+    w = other.w;
+    x = -other.x;
+    y = -other.y;
+    z = -other.z;
   }
 
   void normalize() {
@@ -62,47 +61,39 @@ final class Quaternion {
     z = nz;
   }
 
-  static Quaternion multiply(Quaternion lhs, Quaternion rhs) {
-    Quaternion result = lhs.copy();
-    result.multiplyRight(rhs);
-    return result;
-  }
-
-  static Quaternion fromAngularVelocity(float wx, float wy, float wz, float dtSeconds) {
+  void setFromAngularVelocity(float wx, float wy, float wz, float dtSeconds) {
     float magnitude = (float) Math.sqrt(wx * wx + wy * wy + wz * wz);
     if (magnitude < 1.0e-6f || dtSeconds <= 0.0f) {
-      return new Quaternion();
+      setIdentity();
+      return;
     }
 
     float angle = magnitude * dtSeconds;
     float halfAngle = angle * 0.5f;
     float scale = (float) Math.sin(halfAngle) / magnitude;
-    return new Quaternion(
-        (float) Math.cos(halfAngle),
-        wx * scale,
-        wy * scale,
-        wz * scale
-    );
+    w = (float) Math.cos(halfAngle);
+    x = wx * scale;
+    y = wy * scale;
+    z = wz * scale;
   }
 
-  float[] rotate(float vx, float vy, float vz) {
-    float ix = w * vx + y * vz - z * vy;
-    float iy = w * vy + z * vx - x * vz;
-    float iz = w * vz + x * vy - y * vx;
-    float iw = -x * vx - y * vy - z * vz;
+  void inverseRotate(float vx, float vy, float vz, float[] out) {
+    float rw = w;
+    float rx = -x;
+    float ry = -y;
+    float rz = -z;
 
-    return new float[]{
-        ix * w + iw * -x + iy * -z - iz * -y,
-        iy * w + iw * -y + iz * -x - ix * -z,
-        iz * w + iw * -z + ix * -y - iy * -x
-    };
+    float ix = rw * vx + ry * vz - rz * vy;
+    float iy = rw * vy + rz * vx - rx * vz;
+    float iz = rw * vz + rx * vy - ry * vx;
+    float iw = -rx * vx - ry * vy - rz * vz;
+
+    out[0] = ix * rw + iw * -rx + iy * -rz - iz * -ry;
+    out[1] = iy * rw + iw * -ry + iz * -rx - ix * -rz;
+    out[2] = iz * rw + iw * -rz + ix * -ry - iy * -rx;
   }
 
-  float[] inverseRotate(float vx, float vy, float vz) {
-    return conjugated().rotate(vx, vy, vz);
-  }
-
-  float[] toColumnMajorMatrix3() {
+  void toColumnMajorMatrix3(float[] out) {
     float xx = x * x;
     float yy = y * y;
     float zz = z * z;
@@ -113,16 +104,14 @@ final class Quaternion {
     float wy = w * y;
     float wz = w * z;
 
-    return new float[]{
-        1.0f - 2.0f * (yy + zz),
-        2.0f * (xy + wz),
-        2.0f * (xz - wy),
-        2.0f * (xy - wz),
-        1.0f - 2.0f * (xx + zz),
-        2.0f * (yz + wx),
-        2.0f * (xz + wy),
-        2.0f * (yz - wx),
-        1.0f - 2.0f * (xx + yy)
-    };
+    out[0] = 1.0f - 2.0f * (yy + zz);
+    out[1] = 2.0f * (xy + wz);
+    out[2] = 2.0f * (xz - wy);
+    out[3] = 2.0f * (xy - wz);
+    out[4] = 1.0f - 2.0f * (xx + zz);
+    out[5] = 2.0f * (yz + wx);
+    out[6] = 2.0f * (xz + wy);
+    out[7] = 2.0f * (yz - wx);
+    out[8] = 1.0f - 2.0f * (xx + yy);
   }
 }

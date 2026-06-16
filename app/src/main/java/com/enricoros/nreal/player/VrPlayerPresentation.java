@@ -10,7 +10,11 @@ import android.view.WindowInsetsController;
 import android.view.Window;
 import android.view.WindowManager;
 
+import com.enricoros.nreal.AppLog;
+
 public final class VrPlayerPresentation extends Presentation {
+  private static final String TAG = "VrPlayerPresentation";
+
   private final Vr180Renderer.SurfaceCallback surfaceCallback;
   private VrVideoSurfaceView videoSurfaceView;
   private boolean rendererReleased = false;
@@ -23,6 +27,8 @@ public final class VrPlayerPresentation extends Presentation {
   @Override
   @SuppressWarnings("deprecation")
   protected void onCreate(Bundle savedInstanceState) {
+    AppLog.i(TAG, () -> "onCreate: displayId=" + getDisplay().getDisplayId()
+        + ", displayName=" + getDisplay().getName());
     super.onCreate(savedInstanceState);
     Window window = getWindow();
     if (window != null) {
@@ -31,6 +37,13 @@ public final class VrPlayerPresentation extends Presentation {
     videoSurfaceView = new VrVideoSurfaceView(getContext(), surfaceCallback);
     setContentView(videoSurfaceView);
     videoSurfaceView.post(this::applyImmersiveMode);
+  }
+
+
+  public void setActiveVideoSurfaceIndex(int surfaceIndex) {
+    if (videoSurfaceView != null) {
+      videoSurfaceView.setActiveVideoSurfaceIndex(surfaceIndex);
+    }
   }
 
   public void setHeadRotationMatrix(float[] matrix) {
@@ -51,12 +64,19 @@ public final class VrPlayerPresentation extends Presentation {
     }
   }
 
+  public void setProjectionMode(int projectionMode) {
+    if (videoSurfaceView != null) {
+      videoSurfaceView.setProjectionMode(projectionMode);
+    }
+  }
+
   public boolean isStereoOutput() {
     return videoSurfaceView != null && videoSurfaceView.isStereoOutput();
   }
 
   @Override
   protected void onStart() {
+    AppLog.i(TAG, () -> "onStart: displayId=" + getDisplay().getDisplayId());
     super.onStart();
     if (videoSurfaceView != null) {
       videoSurfaceView.onResume();
@@ -66,14 +86,17 @@ public final class VrPlayerPresentation extends Presentation {
 
   @Override
   protected void onStop() {
+    AppLog.i(TAG, () -> "onStop: displayId=" + getDisplay().getDisplayId());
     releaseRenderer();
     super.onStop();
   }
 
   public void releaseRenderer() {
     if (rendererReleased) {
+      AppLog.d(TAG, "releaseRenderer ignored: already released");
       return;
     }
+    AppLog.i(TAG, () -> "Releasing renderer: displayId=" + getDisplay().getDisplayId());
     rendererReleased = true;
     if (videoSurfaceView != null) {
       videoSurfaceView.releaseRenderer();
@@ -85,6 +108,7 @@ public final class VrPlayerPresentation extends Presentation {
   private void applyImmersiveMode() {
     Window window = getWindow();
     if (window == null || videoSurfaceView == null) {
+      AppLog.d(TAG, "Immersive mode skipped: missing window or surface view");
       return;
     }
 
@@ -93,6 +117,7 @@ public final class VrPlayerPresentation extends Presentation {
     if (controller != null) {
       controller.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
       controller.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+      AppLog.d(TAG, "Applied immersive mode with WindowInsetsController");
       return;
     }
 
@@ -106,6 +131,7 @@ public final class VrPlayerPresentation extends Presentation {
               | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
               | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
       );
+      AppLog.d(TAG, "Applied immersive mode with legacy flags");
     }
   }
 }

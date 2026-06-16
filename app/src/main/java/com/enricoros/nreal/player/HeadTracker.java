@@ -18,15 +18,21 @@ public final class HeadTracker {
 
   private final Quaternion orientation = new Quaternion();
   private final Quaternion recenterCorrection = new Quaternion();
+  private final Quaternion delta = new Quaternion();
+  private final Quaternion recentered = new Quaternion();
   private final float[] gyroBias = new float[3];
+  private final float[] gyro = new float[3];
+  private final float[] accel = new float[3];
+  private final float[] expectedUpInHead = new float[3];
+  private final float[] rotationMatrix = new float[9];
   private long lastTimestampNs = 0L;
   private boolean initialized = false;
   private boolean gyroBiasInitialized = false;
 
   public synchronized float[] update(ImuDataRaw sample) {
     long timestampNs = sample.getUptimeNs();
-    float[] gyro = sample.getGyroscopeRadiansPerSecond();
-    float[] accel = sample.getAccelerationGs();
+    sample.getGyroscopeRadiansPerSecond(gyro);
+    sample.getAccelerationGs(accel);
 
     if (!initialized || timestampNs <= 0L) {
       initialized = true;
@@ -47,14 +53,14 @@ public final class HeadTracker {
     zeroStationaryResidualGyro(gyro, stationary);
 
     applyAccelerometerCorrection(gyro, accel, accelMagnitude);
-    Quaternion delta = Quaternion.fromAngularVelocity(gyro[0], gyro[1], gyro[2], dt);
+    delta.setFromAngularVelocity(gyro[0], gyro[1], gyro[2], dt);
     orientation.multiplyRight(delta);
     orientation.normalize();
     return getRotationMatrixLocked();
   }
 
   public synchronized void recenter() {
-    recenterCorrection.set(orientation.conjugated());
+    recenterCorrection.setConjugated(orientation);
   }
 
   public synchronized void reset() {
@@ -128,7 +134,7 @@ public final class HeadTracker {
     float ay = accel[1] / accelMagnitude;
     float az = accel[2] / accelMagnitude;
 
-    float[] expectedUpInHead = orientation.inverseRotate(0.0f, 1.0f, 0.0f);
+    orientation.inverseRotate(0.0f, 1.0f, 0.0f, expectedUpInHead);
     float errorX = expectedUpInHead[1] * az - expectedUpInHead[2] * ay;
     float errorY = expectedUpInHead[2] * ax - expectedUpInHead[0] * az;
     float errorZ = expectedUpInHead[0] * ay - expectedUpInHead[1] * ax;
@@ -139,9 +145,11 @@ public final class HeadTracker {
   }
 
   private float[] getRotationMatrixLocked() {
-    Quaternion recentered = Quaternion.multiply(recenterCorrection, orientation);
+    recentered.set(recenterCorrection);
+    recentered.multiplyRight(orientation);
     recentered.normalize();
-    return recentered.toColumnMajorMatrix3();
+    recentered.toColumnMajorMatrix3(rotationMatrix);
+    return rotationMatrix;
   }
 
   private static float magnitude(float x, float y, float z) {

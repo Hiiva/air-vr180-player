@@ -28,6 +28,14 @@
         android:textStyle="bold" />
 
     <com.google.android.material.button.MaterialButton
+        android:id="@+id/serverLibraryButton"
+        android:layout_width="wrap_content"
+        android:layout_height="48dp"
+        android:layout_marginEnd="8dp"
+        android:minWidth="0dp"
+        android:text="Server" />
+
+    <com.google.android.material.button.MaterialButton
         android:id="@+id/selectVideoButton"
         android:layout_width="wrap_content"
         android:layout_height="48dp"
@@ -68,12 +76,25 @@
           android:textColor="@color/muted"
           android:textSize="14sp" />
 
-      <SeekBar
-          android:id="@+id/progressSeekBar"
+      <FrameLayout
           android:layout_width="match_parent"
           android:layout_height="48dp"
-          android:layout_marginTop="16dp"
-          android:max="1000" />
+          android:layout_marginTop="16dp">
+
+        <SeekBar
+            android:id="@+id/progressSeekBar"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:max="1000" />
+
+        <com.enricoros.nreal.AbLoopTimelineView
+            android:id="@+id/abLoopTimelineView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:clickable="false"
+            android:focusable="false" />
+
+      </FrameLayout>
 
       <TextView
           android:id="@+id/positionText"
@@ -99,7 +120,7 @@
             android:layout_weight="1"
             android:minWidth="0dp"
             android:text="-10"
-            app:icon="@drawable/ic_replay_10_24"
+            app:icon="@drawable/ic_replay_24"
             app:iconGravity="textStart" />
 
         <com.google.android.material.button.MaterialButton
@@ -121,18 +142,44 @@
             android:layout_weight="1"
             android:minWidth="0dp"
             android:text="+10"
-            app:icon="@drawable/ic_forward_10_24"
+            app:icon="@drawable/ic_forward_24"
             app:iconGravity="textStart" />
 
       </LinearLayout>
 
-      <com.google.android.material.button.MaterialButton
-          android:id="@+id/abLoopButton"
+      <LinearLayout
           android:layout_width="match_parent"
-          android:layout_height="48dp"
+          android:layout_height="wrap_content"
           android:layout_marginTop="8dp"
-          android:minWidth="0dp"
-          android:text="Set loop A" />
+          android:orientation="horizontal">
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/abLoopAButton"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_weight="1"
+            android:minWidth="0dp"
+            android:text="A" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/abLoopBButton"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_marginStart="8dp"
+            android:layout_weight="1"
+            android:minWidth="0dp"
+            android:text="B" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/abLoopClearButton"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_marginStart="8dp"
+            android:layout_weight="1.2"
+            android:minWidth="0dp"
+            android:text="Clear" />
+
+      </LinearLayout>
 
       <com.google.android.material.button.MaterialButton
           android:id="@+id/recenterButton"
@@ -149,9 +196,24 @@
           android:layout_marginVertical="18dp"
           android:background="@color/panel_alt" />
 
+      <TextView
+          android:layout_width="match_parent"
+          android:layout_height="wrap_content"
+          android:text="Projection"
+          android:textColor="@color/ink"
+          android:textSize="15sp"
+          android:textStyle="bold" />
+
+      <Spinner
+          android:id="@+id/projectionModeSpinner"
+          android:layout_width="match_parent"
+          android:layout_height="52dp"
+          android:layout_marginTop="4dp" />
+
       <LinearLayout
           android:layout_width="match_parent"
           android:layout_height="wrap_content"
+          android:layout_marginTop="12dp"
           android:gravity="center_vertical"
           android:orientation="horizontal">
 
@@ -168,7 +230,7 @@
             android:id="@+id/viewScaleValue"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="1.00x"
+            android:text="0.80x"
             android:textColor="@color/muted"
             android:textSize="14sp" />
 
@@ -286,31 +348,63 @@
           android:textStyle="bold" />
 
       <com.google.android.material.switchmaterial.SwitchMaterial
-          android:id="@+id/darkModeSwitch"
-          android:layout_width="match_parent"
-          android:layout_height="48dp"
-          android:layout_marginTop="8dp"
-          android:text="Dark mode"
-          android:textColor="@color/ink"
-          android:textSize="15sp"
-          android:textStyle="bold" />
-
-      <com.google.android.material.switchmaterial.SwitchMaterial
           android:id="@+id/muteAudioSwitch"
           android:layout_width="match_parent"
           android:layout_height="48dp"
+          android:layout_marginTop="8dp"
           android:text="Mute audio"
           android:textColor="@color/ink"
           android:textSize="15sp"
           android:textStyle="bold" />
 
+      <com.google.android.material.textfield.TextInputLayout
+          android:layout_width="match_parent"
+          android:layout_height="wrap_content"
+          android:layout_marginTop="8dp"
+          android:hint="Server URL">
+
+        <com.google.android.material.textfield.TextInputEditText
+            android:id="@+id/serverUrlEditText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:singleLine="true"
+            android:textColor="@color/ink"
+            android:textColorHint="@color/muted" />
+
+      </com.google.android.material.textfield.TextInputLayout>
+
+      <com.google.android.material.textfield.TextInputLayout
+          android:layout_width="match_parent"
+          android:layout_height="wrap_content"
+          android:layout_marginTop="8dp"
+          android:hint="Server API key">
+
+        <com.google.android.material.textfield.TextInputEditText
+            android:id="@+id/serverApiKeyEditText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:inputType="textPassword"
+            android:singleLine="true"
+            android:textColor="@color/ink"
+            android:textColorHint="@color/muted" />
+
+      </com.google.android.material.textfield.TextInputLayout>
+
       <com.google.android.material.button.MaterialButton
-          android:id="@+id/clearRecentVideosButton"
+          android:id="@+id/clearLocalRecentVideosButton"
           style="@style/Widget.MaterialComponents.Button.OutlinedButton"
           android:layout_width="match_parent"
           android:layout_height="48dp"
           android:layout_marginTop="8dp"
-          android:text="Clear recent videos" />
+          android:text="Clear local recent videos" />
+
+      <com.google.android.material.button.MaterialButton
+          android:id="@+id/clearServerRecentVideosButton"
+          style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+          android:layout_width="match_parent"
+          android:layout_height="48dp"
+          android:layout_marginTop="8dp"
+          android:text="Clear server recent videos" />
 
       <TextView
           android:layout_width="match_parent"

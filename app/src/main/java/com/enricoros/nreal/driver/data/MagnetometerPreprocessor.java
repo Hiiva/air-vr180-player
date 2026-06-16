@@ -25,10 +25,10 @@ public class MagnetometerPreprocessor {
     this.firstSample = true;
   }
 
-  public float[] process(int[] rawData, float dT) {
+  public float[] process(int rawX, int rawY, int rawZ, float dT) {
     float alpha = 1 / (1 + (dT * cutoffFrequency));
 
-    updateMinMax(rawData);
+    updateMinMax(rawX, rawY, rawZ);
 
     boolean minIntRangeConditionMet = true;
     for (int i = 0; i < 3; i++) {
@@ -42,7 +42,7 @@ public class MagnetometerPreprocessor {
       for (int i = 0; i < 3; i++) {
         int center = (maxValues[i] + minValues[i]) / 2;
         int halfRange = (maxValues[i] - minValues[i]) / 2;
-        normalizedData[i] = (float) (rawData[i] - center) / halfRange;
+        normalizedData[i] = (float) (rawValueForAxis(rawX, rawY, rawZ, i) - center) / halfRange;
       }
     } else {
       Arrays.fill(normalizedData, 0);
@@ -62,16 +62,25 @@ public class MagnetometerPreprocessor {
     return filteredData;
   }
 
-  private void updateMinMax(int[] rawData) {
+  private void updateMinMax(int rawX, int rawY, int rawZ) {
     for (int i = 0; i < 3; i++) {
+      int rawValue = rawValueForAxis(rawX, rawY, rawZ, i);
       if (firstSample) {
-        minValues[i] = rawData[i];
-        maxValues[i] = rawData[i];
+        minValues[i] = rawValue;
+        maxValues[i] = rawValue;
       } else {
-        minValues[i] = Math.min(minValues[i], rawData[i]);
-        maxValues[i] = Math.max(maxValues[i], rawData[i]);
+        minValues[i] = Math.min(minValues[i], rawValue);
+        maxValues[i] = Math.max(maxValues[i], rawValue);
       }
     }
+  }
+
+  private static int rawValueForAxis(int rawX, int rawY, int rawZ, int axis) {
+    if (axis == 0)
+      return rawX;
+    if (axis == 1)
+      return rawY;
+    return rawZ;
   }
 
   public void resetCalibration() {

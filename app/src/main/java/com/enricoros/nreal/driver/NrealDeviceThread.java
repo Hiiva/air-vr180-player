@@ -4,9 +4,9 @@ import android.annotation.SuppressLint;
 import android.content.SharedPreferences;
 import android.hardware.usb.UsbDeviceConnection;
 import android.hardware.usb.UsbEndpoint;
-import android.util.Log;
 import android.util.Pair;
 
+import com.enricoros.nreal.AppLog;
 import com.enricoros.nreal.driver.data.MagnetometerPreprocessor;
 
 import org.json.JSONArray;
@@ -82,10 +82,12 @@ class NrealDeviceThread extends Thread {
   }
 
   public void quit() {
+    AppLog.i(TAG, "Reader thread quit requested");
     mQuit = true;
     try {
       join(2000);
     } catch (InterruptedException e) {
+      AppLog.w(TAG, "Interrupted while waiting for reader thread to stop", e);
       threadCallbacks.onConnectionError("Could not stop reading the IMU");
     }
   }
@@ -93,8 +95,12 @@ class NrealDeviceThread extends Thread {
 
   public void saveState(SharedPreferences preferences) {
     int[] calibration = magnetometerPreprocessor.saveCalibration();
-    if (calibration != null)
+    if (calibration != null) {
+      AppLog.d(TAG, () -> "Saving magnetometer calibration: values=" + Arrays.toString(calibration));
       preferences.edit().putString("magnetometer_calibration", Arrays.toString(calibration)).apply();
+    } else {
+      AppLog.d(TAG, "No magnetometer calibration available to save");
+    }
   }
 
   public boolean restoreState(SharedPreferences preferences) {
@@ -105,26 +111,35 @@ class NrealDeviceThread extends Thread {
       for (int i = 0; i < split.length; i++)
         ints[i] = Integer.parseInt(split[i]);
       magnetometerPreprocessor.restoreCalibration(ints);
+      AppLog.i(TAG, () -> "Restored magnetometer calibration: count=" + ints.length);
       return true;
     }
+    AppLog.d(TAG, "No magnetometer calibration state to restore");
     return false;
   }
 
 
   @Override
   public void run() {
+    AppLog.i(TAG, "Reader thread starting");
     loadFactoryCalibration();
     if (!t_startImu()) {
+      AppLog.w(TAG, "Could not start IMU stream");
       threadCallbacks.onConnectionError("Could not start reading the IMU");
       return;
     }
+    AppLog.i(TAG, "IMU stream started");
     if (!t_startOther()) {
+      AppLog.w(TAG, "Could not start other HID stream");
       threadCallbacks.onConnectionError("Could not start reading the Others");
       return;
     }
+    AppLog.i(TAG, "Other HID stream started");
     if (t_setDisplayModeStereo()) {
+      AppLog.i(TAG, "Requested Nreal Air SBS stereo display mode");
       threadCallbacks.onMessage("Requested Nreal Air SBS stereo display mode");
     } else {
+      AppLog.w(TAG, "Could not switch Nreal Air to SBS stereo display mode");
       threadCallbacks.onMessage("Could not switch Nreal Air to SBS stereo display mode");
     }
 
@@ -136,6 +151,7 @@ class NrealDeviceThread extends Thread {
       // read the IMU data - must be coming within 200ms (as it's periodic)
       int res = connection.bulkTransfer(imuIn, imuData, 64, 200);
       if (res < 0) {
+        AppLog.w(TAG, "Could not read IMU bulk transfer");
         threadCallbacks.onConnectionError("Could not read the IMU");
         break;
       }
@@ -148,7 +164,7 @@ class NrealDeviceThread extends Thread {
       if (res > 0)
         processOtherData();
     }
-    Log.e(TAG, "Reader thread finished");
+    AppLog.i(TAG, () -> "Reader thread finished: quitRequested=" + mQuit);
   }
 
 
@@ -202,7 +218,7 @@ class NrealDeviceThread extends Thread {
     float aX = (float) (accelX) * ACCEL_SCALE_G;
     float aY = (float) (accelY) * ACCEL_SCALE_G;
     float aZ = (float) (accelZ) * ACCEL_SCALE_G;
-    float[] mag = magnetometerPreprocessor.process(new int[]{magX, magY, magZ}, dT);
+    float[] mag = magnetometerPreprocessor.process(magX, magY, magZ, dT);
 
     if (DEBUG_IMU_TEXT) {
       // convert dRoll to string with 2 decimal places
@@ -226,7 +242,7 @@ class NrealDeviceThread extends Thread {
         // Clicked power - screen is OFF
         threadCallbacks.onButtonPressedTemp(BUTTON_POWER, 0);
       } else
-        Log.e(TAG, "Unknown screen state: " + btnValue);
+        AppLog.e(TAG, "Unknown screen state: " + btnValue);
     } else if (btnIndex == 2) {
       // Brightness up press
       threadCallbacks.onButtonPressedTemp(BUTTON_BRIGHTNESS_UP, btnValue);
@@ -236,37 +252,46 @@ class NrealDeviceThread extends Thread {
       threadCallbacks.onButtonPressedTemp(BUTTON_BRIGHTNESS_DOWN, btnValue);
       //mBrightness = btnValue;
     } else if (DEBUG_OTHER_COMMANDS)
-      Log.e(TAG, "Read Other bytes: 22: " + btnIndex + ", 15: " + otherData[15] + ", 30: " + otherData[30] + ", 23: " + otherData[23] + " - " + Arrays.toString(otherData));
+      AppLog.e(TAG, "Read Other bytes: 22: " + btnIndex + ", 15: " + otherData[15] + ", 30: " + otherData[30] + ", 23: " + otherData[23] + " - " + Arrays.toString(otherData));
   }
 
   private void loadFactoryCalibration() {
     try {
       if (readFactoryGyroCalibration()) {
+        AppLog.i(TAG, "Loaded factory IMU gyro calibration");
         threadCallbacks.onMessage("Loaded factory IMU gyro calibration");
+      } else {
+        AppLog.d(TAG, "Factory IMU gyro calibration was unavailable");
       }
     } catch (RuntimeException e) {
-      Log.w(TAG, "Could not load factory IMU calibration", e);
+      AppLog.w(TAG, "Could not load factory IMU calibration", e);
     }
   }
 
   private boolean readFactoryGyroCalibration() {
     // Pause the IMU stream while asking the glasses for their JSON calibration blob.
+    AppLog.d(TAG, "Reading factory gyro calibration");
     t_sendImuCommand(0x19, new byte[]{0x00}, IMU_COMMAND_TIMEOUT_MS);
 
     byte[] lengthBytes = t_sendImuCommand(0x14, new byte[0], IMU_COMMAND_TIMEOUT_MS);
     if (lengthBytes == null || lengthBytes.length < 4) {
+      AppLog.d(TAG, "Factory gyro calibration length response missing");
       return false;
     }
 
     int configLength = readLe32(lengthBytes, 0);
     if (configLength <= 0 || configLength > MAX_FACTORY_CONFIG_BYTES) {
+      AppLog.w(TAG, "Factory gyro calibration length out of range: " + configLength);
       return false;
     }
+    AppLog.d(TAG, () -> "Factory gyro calibration length=" + configLength);
 
     ByteArrayOutputStream configBytes = new ByteArrayOutputStream(configLength);
     while (configBytes.size() < configLength) {
       byte[] chunk = t_sendImuCommand(0x15, new byte[0], IMU_COMMAND_TIMEOUT_MS);
       if (chunk == null || chunk.length == 0) {
+        AppLog.d(TAG, () -> "Factory gyro calibration chunk missing: bytesRead=" + configBytes.size()
+            + ", expected=" + configLength);
         return false;
       }
       int bytesToWrite = Math.min(chunk.length, configLength - configBytes.size());
@@ -282,6 +307,7 @@ class NrealDeviceThread extends Thread {
       JSONObject imuDevice = config.getJSONObject("IMU").getJSONObject("device_1");
       JSONArray gyroBias = imuDevice.getJSONArray("gyro_bias");
       if (gyroBias.length() < 3) {
+        AppLog.w(TAG, "Factory gyro calibration missing gyro_bias values");
         return false;
       }
 
@@ -289,9 +315,13 @@ class NrealDeviceThread extends Thread {
       gyroCalibrationRadiansPerSecond[0] = -(float) gyroBias.getDouble(0);
       gyroCalibrationRadiansPerSecond[1] = (float) gyroBias.getDouble(1);
       gyroCalibrationRadiansPerSecond[2] = (float) gyroBias.getDouble(2);
+      AppLog.d(TAG, () -> "Parsed factory gyro calibration: "
+          + gyroCalibrationRadiansPerSecond[0] + ", "
+          + gyroCalibrationRadiansPerSecond[1] + ", "
+          + gyroCalibrationRadiansPerSecond[2]);
       return true;
     } catch (JSONException e) {
-      Log.w(TAG, "Could not parse factory IMU calibration", e);
+      AppLog.w(TAG, "Could not parse factory IMU calibration", e);
       return false;
     }
   }
@@ -310,6 +340,9 @@ class NrealDeviceThread extends Thread {
 
     int sent = connection.bulkTransfer(imuOut, packet, packet.length, timeoutMs);
     if (sent != packet.length) {
+      AppLog.d(TAG, () -> "Could not write IMU command " + commandId
+          + ", sent=" + sent
+          + ", expected=" + packet.length);
       return null;
     }
 
@@ -317,6 +350,9 @@ class NrealDeviceThread extends Thread {
       byte[] response = new byte[64];
       int received = connection.bulkTransfer(imuIn, response, response.length, timeoutMs);
       if (received <= 0) {
+        final int attemptIndex = attempt;
+        AppLog.d(TAG, () -> "No IMU command response: commandId=" + commandId
+            + ", attempt=" + attemptIndex);
         return null;
       }
       if (received < 8 || response[0] != (byte) 0xAA || (response[7] & 0xFF) != (commandId & 0xFF)) {
@@ -326,6 +362,7 @@ class NrealDeviceThread extends Thread {
       int responseDataLength = Math.max(0, Math.min(received - 8, responseLength - 3));
       return Arrays.copyOfRange(response, 8, 8 + responseDataLength);
     }
+    AppLog.d(TAG, () -> "No matching IMU command response: commandId=" + commandId);
     return null;
   }
 
@@ -346,6 +383,7 @@ class NrealDeviceThread extends Thread {
   private boolean t_setDisplayModeStereo() {
     // Nreal Air MCU command 0x08 selects display mode. Mode 3 is full SBS,
     // where the external display becomes 3840x1080 with one 1920x1080 half per eye.
+    AppLog.d(TAG, "Sending Nreal display mode stereo command");
     return t_sendMcuCommand(0x08, new byte[]{0x03});
   }
 
@@ -368,7 +406,7 @@ class NrealDeviceThread extends Thread {
 
     int sent = connection.bulkTransfer(otherOut, packet, packet.length, 500);
     if (sent != packet.length) {
-      Log.e(TAG, "Could not write MCU command " + commandId + ", sent=" + sent);
+      AppLog.e(TAG, "Could not write MCU command " + commandId + ", sent=" + sent);
       return false;
     }
 
@@ -376,12 +414,16 @@ class NrealDeviceThread extends Thread {
     int received = connection.bulkTransfer(otherIn, response, response.length, 500);
     if (received <= 0) {
       // Some firmware revisions apply the mode switch without returning a response.
+      AppLog.d(TAG, () -> "MCU command " + commandId + " had no response; assuming success");
       return true;
     }
     if (response[0] != (byte) 0xFD || readLe16(response, 15) != commandId) {
+      AppLog.d(TAG, () -> "MCU command " + commandId + " returned unrelated response; assuming success");
       return true;
     }
     int dataLength = Math.max(0, readLe16(response, 5) - 17);
+    AppLog.d(TAG, () -> "MCU command " + commandId + " response dataLength=" + dataLength
+        + ", status=" + (dataLength > 0 ? response[22] : 0));
     return dataLength == 0 || response[22] == 0;
   }
 
@@ -412,7 +454,7 @@ class NrealDeviceThread extends Thread {
     StringBuilder sb = new StringBuilder().append(prefix).append(from).append(": ");
     for (int i = from; i < from + count; i++)
       sb.append(String.format("%02X ", data[i] & 0xFF));
-    Log.e(TAG, sb.toString());
+    AppLog.e(TAG, sb.toString());
   }
 
 }

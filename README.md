@@ -1,100 +1,148 @@
 # Air VR180 Player
 
-Air VR180 Player is an Android app for watching VR180 side-by-side videos on
-Nreal/Xreal Air glasses. The phone app handles video selection and playback
-controls, while the glasses are used as the external display. USB IMU data from
-the glasses drives 3DoF head tracking for the rendered VR view.
+Air VR180 Player is a personal Android app for watching VR180 side-by-side
+videos on Nreal/Xreal Air glasses.
 
-This repository also contains the low-level Android USB driver code used to
-discover the glasses, request permission, read HID packets, decode IMU/button
-events, and feed tracking data into the player.
+The Android device acts as the controller and media player. The glasses are used
+as the external display, and USB IMU packets from the glasses drive 3DoF head
+tracking in the VR180 renderer.
 
-<img src="docs/Screenshot_20260426_000116_Air%20VR180%20Player.png" alt="Air VR180 Player screenshot" width="420" />
+The repository also includes an optional FastAPI server for browsing and
+streaming a local VR180 video library over a trusted home network.
 
-## Features
+![Air VR180 Player screenshot](docs/Screenshot.png)
 
-- Select local videos through Android's system file picker.
-- Play VR180 side-by-side video through Media3 ExoPlayer.
-- Render the VR view with OpenGL ES using an external video texture.
-- Prefer an attached Nreal/Xreal Air display for presentation output.
-- Automatically switch to side-by-side stereo output on wide external displays.
-- Read Nreal Air USB HID IMU packets for 3DoF head tracking.
-- Recenter tracking from the app UI.
-- Adjust view scale, scene center, and horizon offset.
-- Use playback controls for play/pause, +/-10 second seek, and A-B loop.
-- Remember recent videos and playback positions.
-- Toggle dark mode and mute audio.
-- Show diagnostics for USB connection, external display, tracking, and playback.
+## Current Scope
 
-## Current Status
-
-This is a working experimental app, not a polished SDK.
+This is a personal-use project, not a production app.
 
 Supported and actively used:
 
-- Nreal Air USB device ID `3318:0424`
+- Nreal/Xreal Air glasses with USB device ID `3318:0424`
 - Android USB host access
-- External display presentation
-- 3DoF IMU-driven VR180 viewing
-
-Not yet implemented or incomplete:
-
-- Nreal Light support
-- 6DoF tracking
-- Camera or microphone access
-- A packaged standalone library API
-- Broad device compatibility testing
+- External display presentation mode
+- 3DoF IMU-driven VR180 playback
+- Local file playback
+- Optional local-network library browsing and streaming
 
 ## Requirements
 
-- Android Studio with Android Gradle Plugin 9.2.0 support.
-- JDK compatible with the Android Gradle Plugin version in this repo.
-- Android SDK 36 installed.
-- Android device running Android 11 / API 30 or newer.
-- USB host capable Android device.
-- Nreal Air or compatible Xreal Air glasses.
-- A USB-C setup that exposes both the display output and the USB HID interface
-  to the phone.
+Android app:
 
-## Build
+- Android Studio with Android Gradle Plugin 9.2.0 support
+- Android SDK 36
+- A compatible JDK for the Android Gradle Plugin version used here
+- Android 11 / API 30 or newer
+- A USB host capable Android device
+- Nreal Air or compatible Xreal Air glasses
+- A USB-C connection that exposes both display output and the USB HID interface
 
-Clone the repository:
+Optional video server:
 
-```bash
-git clone https://github.com/hiiva/android-nreal.git
-cd android-nreal
-```
+- Python 3.11 or newer
+- `ffmpeg` and `ffprobe` available on `PATH`
+- A trusted local network between the server machine and Android device
 
-Build a debug APK:
+## Build The Android App
 
-```bash
-./gradlew assembleDebug
-```
-
-On Windows PowerShell:
+From the repository root:
 
 ```powershell
 .\gradlew.bat assembleDebug
 ```
 
-The debug APK is generated under:
+On macOS or Linux:
+
+```bash
+./gradlew assembleDebug
+```
+
+The debug APK is written to:
 
 ```text
 app/build/outputs/apk/debug/
 ```
 
-## Run
+## Configure The Optional Server
+
+Copy the example environment file:
+
+```powershell
+Copy-Item server\.env.example server\.env
+```
+
+Edit `server/.env` for your machine:
+
+```dotenv
+API_KEY=replace-with-a-private-value
+HOST=0.0.0.0
+PORT=50050
+SOURCES=C:\Videos\VR180;D:\MoreVr180
+EXTENSIONS=.mp4,.mkv,.mov
+CACHE_DIR=cache
+USE_HTTPS=false
+```
+
+`SOURCES` is a semicolon-separated list of folders to scan. The server indexes
+matching files, generates thumbnails with `ffmpeg`, and exposes stream URLs for
+the Android app.
+
+Install dependencies and run the server:
+
+```powershell
+py -m venv server\.venv
+server\.venv\Scripts\pip install -r server\requirements.txt
+server\.venv\Scripts\python server\main.py
+```
+
+In the Android app, set the server URL to the machine running the server, for
+example:
+
+```text
+http://192.168.1.20:50050
+```
+
+Then set the server API key in the Android app to the same value as `API_KEY`
+in `server/.env`.
+
+## HTTP And HTTPS
+
+Plain HTTP is the simplest option on a trusted home LAN. The Android app allows
+cleartext traffic because local server IPs usually do not have public
+certificates.
+
+Do not expose the included FastAPI server directly to the internet. If you host
+it outside a private LAN, put it behind a normal HTTPS reverse proxy, use a
+strong API key, and restrict access at the network or proxy layer.
+
+For local HTTPS experiments, the server can use a self-signed certificate:
+
+```dotenv
+USE_HTTPS=true
+CERT_FILE=certs/dev-cert.pem
+KEY_FILE=certs/dev-key.pem
+```
+
+Android will not trust that certificate by default. Debug builds can opt into
+trusting self-signed server certificates through ignored `local.properties`:
+
+```properties
+airVr180.trustAllServerCerts=true
+```
+
+Leave that disabled for public or shared builds.
+
+## Use The App
 
 1. Connect the glasses to the Android device.
 2. Install and open the app from Android Studio, or install the debug APK.
-3. Grant the USB permission prompt when Android asks for access to the glasses.
-4. Tap `Select` and choose a local VR180 video.
-5. Use `Recenter` after putting the glasses on.
-6. Adjust `View scale`, `Scene center`, and `Horizon` if the projection needs
-   alignment.
+3. Grant the Android USB permission prompt.
+4. Choose a local file with `Select`, or enter the server URL and open `Server`.
+5. Put on the glasses and tap `Recenter`.
+6. Adjust scale, scene center, and horizon if the projection needs alignment.
 
-The phone screen remains the controller. The VR video is presented on the
-external glasses display when Android exposes it as a presentation display.
+The phone screen remains the controller. VR video is shown on the external
+glasses display when Android exposes the glasses as a presentation display.
 
 ## Project Layout
 
@@ -116,32 +164,15 @@ app/src/main/java/com/enricoros/nreal/driver/
   NrealDeviceThread.java         HID reader thread
   ImuDataRaw.java                Raw IMU packet model
   UsbUtils.java                  USB discovery helpers
-  data/MagnetometerPreprocessor.java
+
+server/
+  main.py                        Optional local video library server
+  requirements.txt               Python server dependencies
 ```
 
-## Implementation Notes
-
-- Video playback uses `androidx.media3:media3-exoplayer`.
-- The renderer consumes a `SurfaceTexture` backed by an
-  `GL_TEXTURE_EXTERNAL_OES` texture.
-- A display is treated as stereo when it is very wide, currently `width >= 3000`
-  or aspect ratio `>= 2.4`.
-- USB device matching is declared in `app/src/main/res/xml/device_filter.xml`.
-- Viewer settings are stored in Android shared preferences.
-
-## Troubleshooting
-
-- `No attached Nreal devices found`: check that the USB data path is connected,
-  not only display output.
-- `USB permission denied`: unplug/replug the glasses and grant the Android USB
-  permission dialog.
-- `Output: no external Air display`: Android is not exposing the glasses as an
-  external presentation display.
-- Tracking is stale or unavailable: confirm the app has USB permission and the
-  diagnostics line says the IMU is streaming.
-- Video opens but looks wrong: confirm the source is VR180 side-by-side video.
-
 ## Credits
+
+Forked from https://github.com/enricoros/android-nreal
 
 Thanks to members of the Nreal community whose early work and notes helped make
 the USB/IMU side possible:

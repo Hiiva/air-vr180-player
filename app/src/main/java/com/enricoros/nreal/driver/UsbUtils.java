@@ -6,11 +6,12 @@ import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbEndpoint;
 import android.hardware.usb.UsbInterface;
 import android.hardware.usb.UsbManager;
-import android.util.Log;
 import android.util.Pair;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+
+import com.enricoros.nreal.AppLog;
 
 import org.jetbrains.annotations.Contract;
 
@@ -29,9 +30,20 @@ class UsbUtils {
    */
   @Nullable
   public static UsbDevice usbFindConnectedDevice(@NonNull UsbManager usbManager, int vendorId, int productId) {
-    for (UsbDevice device : usbManager.getDeviceList().values())
-      if (device.getVendorId() == vendorId && device.getProductId() == productId)
+    AppLog.d(TAG, () -> "Scanning USB devices: count=" + usbManager.getDeviceList().size()
+        + ", targetVid=" + vendorId
+        + ", targetPid=" + productId);
+    for (UsbDevice device : usbManager.getDeviceList().values()) {
+      AppLog.d(TAG, () -> "USB candidate: id=" + device.getDeviceId()
+          + ", vendorId=" + device.getVendorId()
+          + ", productId=" + device.getProductId()
+          + ", name=" + device.getDeviceName());
+      if (device.getVendorId() == vendorId && device.getProductId() == productId) {
+        AppLog.i(TAG, () -> "Matched USB device: id=" + device.getDeviceId()
+            + ", name=" + device.getDeviceName());
         return device;
+      }
+    }
     return null;
   }
 
@@ -60,17 +72,17 @@ class UsbUtils {
     for (int i = 0; i < usbInterface.getEndpointCount(); i++) {
       UsbEndpoint endpoint = usbInterface.getEndpoint(i);
       if (endpoint.getType() != expectedType) {
-        Log.w(TAG, "Skipping endpoint " + endpoint.getAddress() + " because it is not of expected type " + expectedType + ", but " + endpoint.getType());
+        AppLog.w(TAG, "Skipping endpoint " + endpoint.getAddress() + " because it is not of expected type " + expectedType + ", but " + endpoint.getType());
         return null;
       }
 
       if (endpoint.getDirection() == UsbConstants.USB_DIR_IN) {
         if (endpoint.getAddress() != expectedAddressIn)
-          Log.w(TAG, "Instead of using USB Input Endpoint " + expectedAddressIn + ", we are using endpoint " + endpoint.getAddress());
+          AppLog.w(TAG, "Instead of using USB Input Endpoint " + expectedAddressIn + ", we are using endpoint " + endpoint.getAddress());
         endpointIn = endpoint;
       } else if (endpoint.getDirection() == UsbConstants.USB_DIR_OUT) {
         if (endpoint.getAddress() != expectedAddressOut)
-          Log.w(TAG, "Instead of using USB Output Endpoint " + expectedAddressOut + ", we are using endpoint " + endpoint.getAddress());
+          AppLog.w(TAG, "Instead of using USB Output Endpoint " + expectedAddressOut + ", we are using endpoint " + endpoint.getAddress());
         endpointOut = endpoint;
       }
     }
@@ -79,14 +91,14 @@ class UsbUtils {
 
 
   public static void logDevice(String prettyName, @NonNull UsbDevice device) {
-    Log.i(TAG, "USB Device information [" + prettyName + "]:");
-    Log.i(TAG, " - ID: " + device.getDeviceId() + " (VID: " + device.getVendorId() + ", PID: " + device.getProductId() + "), Name: " + device.getDeviceName() + ", Class: " + prettyUsbInterfaceClass(device.getDeviceClass(), device.getDeviceSubclass()) + ", Protocol: " + device.getDeviceProtocol());
-    Log.i(TAG, " - Configurations: " + device.getConfigurationCount());
+    AppLog.i(TAG, "USB Device information [" + prettyName + "]:");
+    AppLog.i(TAG, " - ID: " + device.getDeviceId() + " (VID: " + device.getVendorId() + ", PID: " + device.getProductId() + "), Name: " + device.getDeviceName() + ", Class: " + prettyUsbInterfaceClass(device.getDeviceClass(), device.getDeviceSubclass()) + ", Protocol: " + device.getDeviceProtocol());
+    AppLog.i(TAG, " - Configurations: " + device.getConfigurationCount());
     for (int i = 0; i < device.getConfigurationCount(); i++) {
       UsbConfiguration usbConfiguration = device.getConfiguration(i);
       logConfiguration(usbConfiguration, "  ");
     }
-    Log.i(TAG, " - Interfaces: " + device.getInterfaceCount());
+    AppLog.i(TAG, " - Interfaces: " + device.getInterfaceCount());
     for (int i = 0; i < device.getInterfaceCount(); i++) {
       UsbInterface usbInterface = device.getInterface(i);
       logInterface(usbInterface, "  ");
@@ -94,11 +106,11 @@ class UsbUtils {
   }
 
   private static void logConfiguration(@NonNull UsbConfiguration usbConfiguration, String prefix) {
-    Log.i(TAG, prefix + " - cid: " + usbConfiguration.getId() + valueIfNotNull("name", usbConfiguration.getName()) + ", max power: " + usbConfiguration.getMaxPower() + ", Interfaces: " + usbConfiguration.getInterfaceCount());
+    AppLog.i(TAG, prefix + " - cid: " + usbConfiguration.getId() + valueIfNotNull("name", usbConfiguration.getName()) + ", max power: " + usbConfiguration.getMaxPower() + ", Interfaces: " + usbConfiguration.getInterfaceCount());
   }
 
   private static void logInterface(@NonNull UsbInterface i, String prefix) {
-    Log.i(TAG, prefix + " - " + i.getId() + ":" + i.getAlternateSetting() + valueIfNotNull("name", i.getName()) + ", class: " + prettyUsbInterfaceClass(i.getInterfaceClass(), i.getInterfaceSubclass()) + (i.getInterfaceProtocol() != 0 ? ", protocol: " + i.getInterfaceProtocol() : ""));
+    AppLog.i(TAG, prefix + " - " + i.getId() + ":" + i.getAlternateSetting() + valueIfNotNull("name", i.getName()) + ", class: " + prettyUsbInterfaceClass(i.getInterfaceClass(), i.getInterfaceSubclass()) + (i.getInterfaceProtocol() != 0 ? ", protocol: " + i.getInterfaceProtocol() : ""));
     for (int j = 0; j < i.getEndpointCount(); j++) {
       UsbEndpoint usbEndpoint = i.getEndpoint(j);
       logEndpoint(usbEndpoint, prefix + "  ");
@@ -106,7 +118,7 @@ class UsbUtils {
   }
 
   private static void logEndpoint(@NonNull UsbEndpoint e, String prefix) {
-    Log.i(TAG, prefix + "   - eid: " + e.getEndpointNumber() + ":" + e.getAttributes() + ", address: " + e.getAddress() + (e.getDirection() == UsbConstants.USB_DIR_IN ? ", Input" : ", Output") + ", type: " + e.getType() + ", size: " + e.getMaxPacketSize() + (e.getInterval() != 1 ? ", interval: " + e.getInterval() : ""));
+    AppLog.i(TAG, prefix + "   - eid: " + e.getEndpointNumber() + ":" + e.getAttributes() + ", address: " + e.getAddress() + (e.getDirection() == UsbConstants.USB_DIR_IN ? ", Input" : ", Output") + ", type: " + e.getType() + ", size: " + e.getMaxPacketSize() + (e.getInterval() != 1 ? ", interval: " + e.getInterval() : ""));
   }
 
   @NonNull

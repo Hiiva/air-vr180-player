@@ -56,6 +56,10 @@ public class ImuDataRaw {
 
   // copy constructor - used for now to send between threads
   public ImuDataRaw(@NonNull ImuDataRaw other) {
+    copyFrom(other);
+  }
+
+  void copyFrom(@NonNull ImuDataRaw other) {
     this.accelX = other.accelX;
     this.accelY = other.accelY;
     this.accelZ = other.accelZ;
@@ -84,19 +88,27 @@ public class ImuDataRaw {
   }
 
   public float[] getAccelerationGs() {
-    return new float[]{
-        -accelX * ACCEL_SCALE_G,
-        accelZ * ACCEL_SCALE_G,
-        accelY * ACCEL_SCALE_G
-    };
+    float[] acceleration = new float[3];
+    getAccelerationGs(acceleration);
+    return acceleration;
+  }
+
+  public void getAccelerationGs(float[] acceleration) {
+    acceleration[0] = -accelX * ACCEL_SCALE_G;
+    acceleration[1] = accelZ * ACCEL_SCALE_G;
+    acceleration[2] = accelY * ACCEL_SCALE_G;
   }
 
   public float[] getGyroscopeRadiansPerSecond() {
-    return new float[]{
-        -angVelX * GYRO_SCALE_RADIANS_PER_SECOND + gyroCalibrationRadiansPerSecond[0],
-        angVelZ * GYRO_SCALE_RADIANS_PER_SECOND + gyroCalibrationRadiansPerSecond[1],
-        angVelY * GYRO_SCALE_RADIANS_PER_SECOND + gyroCalibrationRadiansPerSecond[2]
-    };
+    float[] gyroscope = new float[3];
+    getGyroscopeRadiansPerSecond(gyroscope);
+    return gyroscope;
+  }
+
+  public void getGyroscopeRadiansPerSecond(float[] gyroscope) {
+    gyroscope[0] = -angVelX * GYRO_SCALE_RADIANS_PER_SECOND + gyroCalibrationRadiansPerSecond[0];
+    gyroscope[1] = angVelZ * GYRO_SCALE_RADIANS_PER_SECOND + gyroCalibrationRadiansPerSecond[1];
+    gyroscope[2] = angVelY * GYRO_SCALE_RADIANS_PER_SECOND + gyroCalibrationRadiansPerSecond[2];
   }
 
   public long getUptimeNs() {

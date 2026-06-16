@@ -4,6 +4,8 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.net.Uri;
 
+import com.enricoros.nreal.AppLog;
+
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -13,6 +15,7 @@ import java.util.Iterator;
 import java.util.List;
 
 public final class RecentVideoStore {
+  private static final String TAG = "RecentVideoStore";
   private static final String PREF_NAME = "recent_videos";
   private static final String KEY_ITEMS = "items";
   private static final int MAX_ITEMS = 24;
@@ -39,17 +42,28 @@ public final class RecentVideoStore {
         videos.add(new RecentVideo(
             Uri.parse(uriText),
             title,
+            item.optLong("size", 0L),
             item.optLong("positionMs", 0L),
-            item.optLong("durationMs", 0L)
+            item.optLong("watchedTimeMs", 0L),
+            item.optLong("durationMs", 0L),
+            item.has("projectionMode") ? item.optInt("projectionMode", 0) : ProjectionModeGuesser.guess(title)
         ));
       }
     } catch (JSONException ignored) {
+      AppLog.w(TAG, "Could not parse saved recent videos; clearing preference", ignored);
       preferences.edit().remove(KEY_ITEMS).apply();
     }
+    AppLog.d(TAG, () -> "Loaded recent videos: count=" + videos.size());
     return videos;
   }
 
   public static void upsert(Context context, List<RecentVideo> videos, RecentVideo video) {
+    AppLog.d(TAG, () -> "Upserting recent video: title=" + video.title
+        + ", uri=" + video.uri
+        + ", size=" + video.size
+        + ", durationMs=" + video.durationMs
+        + ", positionMs=" + video.lastPositionMs
+        + ", watchedTimeMs=" + video.watchedTimeMs);
     for (Iterator<RecentVideo> iterator = videos.iterator(); iterator.hasNext(); ) {
       RecentVideo existing = iterator.next();
       if (existing.uri.equals(video.uri)) {
@@ -65,16 +79,21 @@ public final class RecentVideoStore {
   }
 
   public static void save(Context context, List<RecentVideo> videos) {
+    AppLog.d(TAG, () -> "Saving recent videos: count=" + videos.size());
     JSONArray array = new JSONArray();
     for (RecentVideo video : videos) {
       JSONObject item = new JSONObject();
       try {
         item.put("uri", video.uri.toString());
         item.put("title", video.title);
+        item.put("size", video.size);
         item.put("positionMs", video.lastPositionMs);
+        item.put("watchedTimeMs", video.watchedTimeMs);
         item.put("durationMs", video.durationMs);
+        item.put("projectionMode", video.projectionMode);
         array.put(item);
       } catch (JSONException ignored) {
+        AppLog.w(TAG, "Could not serialize recent video: title=" + video.title, ignored);
         // JSONObject only throws for invalid numbers; these values are app-owned.
       }
     }
@@ -85,10 +104,12 @@ public final class RecentVideoStore {
   }
 
   public static void clear(Context context, List<RecentVideo> videos) {
+    AppLog.i(TAG, () -> "Clearing recent videos: count=" + videos.size());
     videos.clear();
     context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
         .edit()
         .remove(KEY_ITEMS)
         .apply();
   }
+
 }
