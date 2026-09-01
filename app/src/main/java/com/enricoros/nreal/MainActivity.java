@@ -75,6 +75,7 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
@@ -83,7 +84,6 @@ import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
@@ -120,8 +120,8 @@ public class MainActivity extends AppCompatActivity {
   private static final String PREF_SERVER_API_KEY = "server_api_key";
   private static final String PREF_SERVER_SORT = "server_sort";
   private static final String PREF_SERVER_JUMP_LAST = "server_jump_last";
-  private static final String PREF_SERVER_RECENTS = "server_recents";
-  private static final String PREF_LAST_SERVER_VIDEO_ID = "last_server_video_id";
+  private static final String PREF_SERVER_HISTORY_PENDING = "server_history_pending";
+  private static final long SERVER_HISTORY_SYNC_INTERVAL_MS = 15_000L;
   private static final int SERVER_REFRESH_WAIT_MS = 1200;
   private static final int SERVER_REFRESH_POLL_DELAY_MS = 2500;
   private static final int SERVER_REFRESH_POLL_MAX_ATTEMPTS = 8;
@@ -167,6 +167,8 @@ public class MainActivity extends AppCompatActivity {
   private final List<ServerVideo> serverPlayedVideos = new ArrayList<>();
   private final PriorityTaskManager playbackPriorityTaskManager = new PriorityTaskManager();
   private final ExecutorService thumbnailExecutor = Executors.newFixedThreadPool(8);
+  private final ExecutorService serverHistoryExecutor = Executors.newSingleThreadExecutor();
+  private final Object serverHistoryPendingLock = new Object();
   private final Set<String> thumbnailsInFlight = Collections.synchronizedSet(new HashSet<>());
   private final LruCache<String, Bitmap> thumbnailCache = new LruCache<String, Bitmap>(64 * 1024) {
     @Override
@@ -227,6 +229,7 @@ public class MainActivity extends AppCompatActivity {
   private boolean loopRestartPending = false;
   private boolean watchTimeTrackingActive = false;
   private long lastWatchTimeElapsedMs = 0L;
+  private long lastServerHistorySyncElapsedMs = 0L;
 
   private final ActivityResultLauncher<String[]> openVideoLauncher =
       registerForActivityResult(new ActivityResultContracts.OpenDocument(), this::onVideoSelected);
@@ -236,6 +239,7 @@ public class MainActivity extends AppCompatActivity {
     public void run() {
       progressUpdatesScheduled = false;
       updatePlaybackProgress();
+      syncCurrentServerProgressIfDue();
       scheduleProgressUpdates();
     }
   };
@@ -399,7 +403,7 @@ public class MainActivity extends AppCompatActivity {
     applyAudioMuted();
     nrealManager = new NrealManager(getApplicationContext(), nrealListener);
     recentVideos.addAll(RecentVideoStore.load(this));
-    serverPlayedVideos.addAll(loadServerPlayedVideos());
+    flushPendingServerHistorySyncs();
     AppLog.i(TAG, () -> "Loaded startup state: recentVideos=" + recentVideos.size()
         + ", serverPlayedVideos=" + serverPlayedVideos.size()
         + ", audioMuted=" + audioMuted
@@ -462,6 +466,7 @@ public class MainActivity extends AppCompatActivity {
       nrealManager = null;
     }
     thumbnailExecutor.shutdownNow();
+    serverHistoryExecutor.shutdown();
     super.onDestroy();
   }
 
@@ -824,7 +829,12 @@ public class MainActivity extends AppCompatActivity {
     player.setMediaItem(MediaItem.fromUri(video.uri), Math.max(0L, video.lastPositionMs));
     player.prepare();
     player.play();
-    headTracker.recenter();
+    if (currentVideoFromServer && currentServerVideo != null) {
+      loopStartMs = currentServerVideo.loopStartMs;
+      loopEndMs = currentServerVideo.loopEndMs;
+      onLoopPointsChanged();
+    }
+    headTracker.startViewingSession();
     updatePlaybackUi();
     if (!currentVideoFromServer) {
       renderRecentVideos();
@@ -842,8 +852,9 @@ public class MainActivity extends AppCompatActivity {
     currentVideo = null;
     currentVideoFromServer = true;
     currentServerVideo = serverVideo;
-    settingsPreferences.edit().putString(PREF_LAST_SERVER_VIDEO_ID, serverVideo.id).apply();
     upsertServerPlayedVideo(serverVideo);
+    queueServerHistorySync(serverVideo, true);
+    lastServerHistorySyncElapsedMs = SystemClock.elapsedRealtime();
     RecentVideo video = new RecentVideo(
         serverVideo.uri,
         serverVideo.displayTitle(),
@@ -954,9 +965,10 @@ public class MainActivity extends AppCompatActivity {
           }
           serverVideos.clear();
           serverVideos.addAll(videos);
+          serverPlayedVideos.clear();
+          serverPlayedVideos.addAll(result.playedVideos);
           serverVideosLoadedThisSession = true;
           serverLoadedUrlThisSession = loadedServerUrl;
-          mergeServerHistoryMetadata();
           AppLog.i(TAG, () -> "Server videos loaded: count=" + videos.size()
               + ", url=" + loadedServerUrl
               + ", refreshing=" + result.refreshing
@@ -1013,8 +1025,8 @@ public class MainActivity extends AppCompatActivity {
 
   private ServerVideoLoadResult fetchServerVideosWithFallback(String serverUrl, boolean manualRefresh, int pollAttempt) throws IOException, JSONException {
     try {
-      ServerVideoLoadResult result = fetchServerVideos(serverUrl, manualRefresh, pollAttempt);
-      return new ServerVideoLoadResult(serverUrl, result.videos, result.refreshing, result.cacheAgeSeconds);
+        ServerVideoLoadResult result = fetchServerVideos(serverUrl, manualRefresh, pollAttempt);
+      return new ServerVideoLoadResult(serverUrl, result.videos, result.playedVideos, result.refreshing, result.cacheAgeSeconds);
     } catch (IOException firstError) {
       String fallbackUrl = localHttpFallbackUrl(serverUrl);
       if (fallbackUrl.length() == 0 || fallbackUrl.equals(serverUrl)) {
@@ -1025,7 +1037,7 @@ public class MainActivity extends AppCompatActivity {
       try {
         ServerVideoLoadResult result = fetchServerVideos(fallbackUrl, manualRefresh, pollAttempt);
         AppLog.i(TAG, () -> "HTTP fallback server fetch succeeded: fallback=" + fallbackUrl);
-        return new ServerVideoLoadResult(fallbackUrl, result.videos, result.refreshing, result.cacheAgeSeconds);
+        return new ServerVideoLoadResult(fallbackUrl, result.videos, result.playedVideos, result.refreshing, result.cacheAgeSeconds);
       } catch (IOException | JSONException fallbackError) {
         firstError.addSuppressed(fallbackError);
         throw firstError;
@@ -1065,40 +1077,76 @@ public class MainActivity extends AppCompatActivity {
     List<ServerVideo> videos = new ArrayList<>();
     if (items == null) {
       AppLog.w(TAG, "Server video response did not include a videos array");
-      return new ServerVideoLoadResult(serverUrl, videos, root.optBoolean("refreshing", false), root.optLong("cache_age_seconds", -1L));
+      return new ServerVideoLoadResult(serverUrl, videos, new ArrayList<>(), root.optBoolean("refreshing", false), root.optLong("cache_age_seconds", -1L));
     }
     for (int i = 0; i < items.length(); i++) {
       JSONObject item = items.optJSONObject(i);
       if (item == null) {
         continue;
       }
-      String title = item.optString("title", "Server video");
-      String streamUrl = item.optString("stream_url", "");
-      if (streamUrl.length() == 0) {
-        AppLog.w(TAG, () -> "Skipping server video without stream URL: title=" + title);
-        continue;
+      ServerVideo video = parseServerVideo(item);
+      if (video != null) {
+        videos.add(video);
       }
-      videos.add(new ServerVideo(
-          item.optString("id", streamUrl),
-          title,
-          item.optString("file_name", title),
-          item.optString("subfolder", ""),
-          Uri.parse(streamUrl),
-          item.optString("thumbnail_url", ""),
-          item.optLong("size", 0L),
-          item.optLong("duration_ms", 0L),
-          parseModifiedMillis(item.optString("modified", "")),
-          item.optString("file_date", ""),
-          item.optBoolean("flagged_for_deletion", false),
-          0L,
-          0L,
-          ProjectionModeGuesser.guess(joinParts(java.util.Arrays.asList(
-              item.optString("file_name", title),
-              item.optString("subfolder", ""),
-              title)))
-      ));
     }
-    return new ServerVideoLoadResult(serverUrl, videos, root.optBoolean("refreshing", false), root.optLong("cache_age_seconds", -1L));
+    List<ServerVideo> playedVideos = new ArrayList<>();
+    JSONArray historyItems = root.optJSONArray("history");
+    if (historyItems != null) {
+      for (int i = 0; i < historyItems.length(); i++) {
+        ServerVideo video = parseServerVideo(historyItems.optJSONObject(i));
+        if (video != null) {
+          playedVideos.add(video);
+        }
+      }
+    }
+    for (ServerVideo playedVideo : playedVideos) {
+      ServerVideo video = findServerVideo(videos, playedVideo.id);
+      if (video != null) {
+        video.lastPositionMs = playedVideo.lastPositionMs;
+        video.watchedTimeMs = playedVideo.watchedTimeMs;
+        video.projectionMode = playedVideo.projectionMode;
+        video.loopStartMs = playedVideo.loopStartMs;
+        video.loopEndMs = playedVideo.loopEndMs;
+      }
+    }
+    return new ServerVideoLoadResult(serverUrl, videos, playedVideos, root.optBoolean("refreshing", false), root.optLong("cache_age_seconds", -1L));
+  }
+
+  private ServerVideo parseServerVideo(JSONObject item) {
+    if (item == null) {
+      return null;
+    }
+    String title = item.optString("title", "Server video");
+    String streamUrl = item.optString("stream_url", "");
+    if (streamUrl.length() == 0) {
+      AppLog.w(TAG, () -> "Skipping server video without stream URL: title=" + title);
+      return null;
+    }
+    return new ServerVideo(
+        item.optString("id", streamUrl),
+        title,
+        item.optString("file_name", title),
+        item.optString("subfolder", ""),
+        Uri.parse(streamUrl),
+        item.optString("thumbnail_url", ""),
+        item.optLong("size", 0L),
+        item.optLong("duration_ms", 0L),
+        parseModifiedMillis(item.optString("modified", "")),
+        item.optString("file_date", ""),
+        item.optBoolean("flagged_for_deletion", false),
+        item.optLong("position_ms", 0L),
+        item.optLong("watched_ms", 0L),
+        item.optInt("projection_mode", ProjectionModeGuesser.guess(joinParts(java.util.Arrays.asList(
+            item.optString("file_name", title),
+            item.optString("subfolder", ""),
+            title)))),
+        optionalJsonLong(item, "loop_start_ms"),
+        optionalJsonLong(item, "loop_end_ms")
+    );
+  }
+
+  private static long optionalJsonLong(JSONObject item, String key) {
+    return !item.has(key) || item.isNull(key) ? C.TIME_UNSET : Math.max(0L, item.optLong(key, 0L));
   }
 
   private void seekRelative(long deltaMs) {
@@ -1267,6 +1315,7 @@ public class MainActivity extends AppCompatActivity {
         + ", current=" + currentVideoTitleForLog());
     onLoopPointsChanged();
     updateLoopControls();
+    persistCurrentServerLoopPoints();
   }
 
   private void setLoopEndToCurrentPosition() {
@@ -1280,6 +1329,7 @@ public class MainActivity extends AppCompatActivity {
         + ", current=" + currentVideoTitleForLog());
     onLoopPointsChanged();
     updateLoopControls();
+    persistCurrentServerLoopPoints();
   }
 
   private void onLoopPointsChanged() {
@@ -1302,6 +1352,32 @@ public class MainActivity extends AppCompatActivity {
     AppLog.i(TAG, () -> "Loop cleared: current=" + currentVideoTitleForLog());
     resetLoop();
     updateLoopControls();
+    persistCurrentServerLoopPoints();
+  }
+
+  private void persistCurrentServerLoopPoints() {
+    if (!currentVideoFromServer || currentVideo == null || currentServerVideo == null) {
+      return;
+    }
+    if (player != null) {
+      updateWatchTimeTracking();
+      long duration = getKnownDuration();
+      long position = Math.max(0L, player.getCurrentPosition());
+      if (duration > 0L && duration - position < 2500L) {
+        position = 0L;
+      }
+      currentVideo.lastPositionMs = position;
+      currentVideo.durationMs = duration;
+      currentServerVideo.lastPositionMs = position;
+      currentServerVideo.watchedTimeMs = currentVideo.watchedTimeMs;
+      if (duration > 0L) {
+        currentServerVideo.durationMs = duration;
+      }
+    }
+    currentServerVideo.loopStartMs = loopStartMs;
+    currentServerVideo.loopEndMs = loopEndMs;
+    upsertServerPlayedVideo(currentServerVideo);
+    queueServerHistorySync(currentServerVideo, false);
   }
 
   private void resetLoop() {
@@ -2115,8 +2191,9 @@ public class MainActivity extends AppCompatActivity {
     List<ServerVideo> source = "played".equals(serverDialogTab) ? serverPlayedVideos : serverVideos;
     List<ServerVideo> videos = new ArrayList<>();
     String query = normalizedServerSearchQuery();
+    String[] queryTerms = query.length() == 0 ? new String[0] : query.split(" ");
     for (ServerVideo video : source) {
-      if (query.length() == 0 || matchesServerSearch(video, query)) {
+      if (query.length() == 0 || matchesServerSearch(video, queryTerms)) {
         videos.add(video);
       }
     }
@@ -2126,14 +2203,11 @@ public class MainActivity extends AppCompatActivity {
   }
 
   private String normalizedServerSearchQuery() {
-    return serverSearchQuery == null ? "" : serverSearchQuery.trim().toLowerCase(Locale.US);
+    return SearchMatcher.normalize(serverSearchQuery);
   }
 
-  private boolean matchesServerSearch(ServerVideo video, String query) {
-    return video.displayTitle().toLowerCase(Locale.US).contains(query)
-        || video.fileName.toLowerCase(Locale.US).contains(query)
-        || video.subfolder.toLowerCase(Locale.US).contains(query)
-        || video.fileDate.toLowerCase(Locale.US).contains(query);
+  private boolean matchesServerSearch(ServerVideo video, String[] queryTerms) {
+    return SearchMatcher.matches(video.searchText, queryTerms);
   }
 
   private int compareServerVideos(ServerVideo left, ServerVideo right, String sort) {
@@ -2163,7 +2237,7 @@ public class MainActivity extends AppCompatActivity {
     }
     String currentId = currentServerVideo != null
         ? currentServerVideo.id
-        : settingsPreferences.getString(PREF_LAST_SERVER_VIDEO_ID, "");
+        : latestServerHistoryId();
     int index = -1;
     for (int i = 0; i < visible.size(); i++) {
       if (visible.get(i).id.equals(currentId)) {
@@ -2186,7 +2260,7 @@ public class MainActivity extends AppCompatActivity {
     if (serverVideoRecyclerView == null || !settingsPreferences.getBoolean(PREF_SERVER_JUMP_LAST, true)) {
       return;
     }
-    String lastId = settingsPreferences.getString(PREF_LAST_SERVER_VIDEO_ID, "");
+    String lastId = latestServerHistoryId();
     if (lastId.length() == 0) {
       return;
     }
@@ -2327,7 +2401,7 @@ public class MainActivity extends AppCompatActivity {
     }
     String lastId = currentServerVideo != null
         ? currentServerVideo.id
-        : settingsPreferences.getString(PREF_LAST_SERVER_VIDEO_ID, "");
+        : latestServerHistoryId();
     if (lastId.length() == 0) {
       return 0;
     }
@@ -2466,9 +2540,9 @@ public class MainActivity extends AppCompatActivity {
         + ", currentFromServer=" + currentVideoFromServer);
     serverPlayedVideos.clear();
     settingsPreferences.edit()
-        .remove(PREF_SERVER_RECENTS)
-        .remove(PREF_LAST_SERVER_VIDEO_ID)
-        .apply();
+        .remove(PREF_SERVER_HISTORY_PENDING)
+        .commit();
+    queueClearServerHistory();
     if (currentVideoFromServer) {
       currentVideo = null;
       currentServerVideo = null;
@@ -2591,7 +2665,7 @@ public class MainActivity extends AppCompatActivity {
         currentServerVideo.durationMs = duration;
       }
       upsertServerPlayedVideo(currentServerVideo);
-      saveServerPlayedVideos();
+      queueServerHistorySync(currentServerVideo, false);
       renderServerDialogRows();
     } else {
       RecentVideoStore.save(this, recentVideos);
@@ -2648,6 +2722,7 @@ public class MainActivity extends AppCompatActivity {
     if (currentVideoFromServer && currentServerVideo != null) {
       currentServerVideo.projectionMode = projectionMode;
       upsertServerPlayedVideo(currentServerVideo);
+      queueServerHistorySync(currentServerVideo, false);
       renderServerDialogRows();
     } else {
       RecentVideoStore.save(this, recentVideos);
@@ -2719,103 +2794,168 @@ public class MainActivity extends AppCompatActivity {
     return meta;
   }
 
-  private List<ServerVideo> loadServerPlayedVideos() {
-    List<ServerVideo> videos = new ArrayList<>();
-    String rawJson = settingsPreferences.getString(PREF_SERVER_RECENTS, "[]");
-    try {
-      JSONArray array = new JSONArray(rawJson);
-      for (int i = 0; i < array.length(); i++) {
-        JSONObject item = array.optJSONObject(i);
-        if (item == null) {
-          continue;
-        }
-        String streamUrl = item.optString("stream_url", "");
-        if (streamUrl.length() == 0) {
-          continue;
-        }
-        videos.add(new ServerVideo(
-            item.optString("id", streamUrl),
-            item.optString("title", "Server video"),
-            item.optString("file_name", item.optString("title", "Server video")),
-            item.optString("subfolder", ""),
-            Uri.parse(streamUrl),
-            item.optString("thumbnail_url", ""),
-            item.optLong("size", 0L),
-            item.optLong("duration_ms", 0L),
-            item.optLong("modified_ms", 0L),
-            item.optString("file_date", ""),
-            item.optBoolean("flagged_for_deletion", false),
-            item.optLong("position_ms", 0L),
-            item.optLong("watched_ms", 0L),
-            item.optInt("projection_mode", ProjectionModeGuesser.guess(joinParts(java.util.Arrays.asList(
-                item.optString("file_name", item.optString("title", "Server video")),
-                item.optString("subfolder", ""),
-                item.optString("title", "Server video")))))
-        ));
-      }
-    } catch (JSONException ignored) {
-      AppLog.w(TAG, "Could not parse saved server played videos; clearing preference", ignored);
-      settingsPreferences.edit().remove(PREF_SERVER_RECENTS).apply();
-    }
-    AppLog.d(TAG, () -> "Loaded server played videos: count=" + videos.size());
-    return videos;
-  }
-
-  private void saveServerPlayedVideos() {
-    JSONArray array = new JSONArray();
-    for (ServerVideo video : serverPlayedVideos) {
-      JSONObject item = new JSONObject();
-      try {
-        item.put("id", video.id);
-        item.put("title", video.title);
-        item.put("file_name", video.fileName);
-        item.put("subfolder", video.subfolder);
-        item.put("stream_url", video.uri.toString());
-        item.put("thumbnail_url", video.thumbnailUrl);
-        item.put("size", video.size);
-        item.put("duration_ms", video.durationMs);
-        item.put("modified_ms", video.modifiedMs);
-        item.put("file_date", video.fileDate);
-        item.put("flagged_for_deletion", video.flaggedForDeletion);
-        item.put("position_ms", video.lastPositionMs);
-        item.put("watched_ms", video.watchedTimeMs);
-        item.put("projection_mode", video.projectionMode);
-        array.put(item);
-      } catch (JSONException ignored) {
-        AppLog.w(TAG, "Could not serialize server played video: id=" + video.id, ignored);
-      }
-    }
-    AppLog.d(TAG, () -> "Saving server played videos: count=" + serverPlayedVideos.size());
-    settingsPreferences.edit().putString(PREF_SERVER_RECENTS, array.toString()).apply();
-  }
-
   private void upsertServerPlayedVideo(ServerVideo video) {
     AppLog.d(TAG, () -> "Upserting server played video: id=" + video.id
         + ", title=" + video.displayTitle()
         + ", positionMs=" + video.lastPositionMs
         + ", watchedTimeMs=" + video.watchedTimeMs);
-    for (Iterator<ServerVideo> iterator = serverPlayedVideos.iterator(); iterator.hasNext(); ) {
-      if (iterator.next().id.equals(video.id)) {
-        iterator.remove();
+    for (int i = 0; i < serverPlayedVideos.size(); i++) {
+      if (serverPlayedVideos.get(i).id.equals(video.id)) {
+        serverPlayedVideos.remove(i);
         break;
       }
     }
     serverPlayedVideos.add(0, video.copy());
-    while (serverPlayedVideos.size() > 48) {
-      serverPlayedVideos.remove(serverPlayedVideos.size() - 1);
-    }
-    saveServerPlayedVideos();
   }
 
-  private void mergeServerHistoryMetadata() {
-    for (ServerVideo played : serverPlayedVideos) {
-      ServerVideo fresh = findServerVideo(serverVideos, played.id);
-      if (fresh != null) {
-        fresh.lastPositionMs = played.lastPositionMs;
-        fresh.watchedTimeMs = played.watchedTimeMs;
-        fresh.flaggedForDeletion = played.flaggedForDeletion;
-        fresh.projectionMode = played.projectionMode;
+  private void syncCurrentServerProgressIfDue() {
+    if (!currentVideoFromServer || currentServerVideo == null || currentVideo == null || player == null) {
+      return;
+    }
+    long now = SystemClock.elapsedRealtime();
+    if (now - lastServerHistorySyncElapsedMs < SERVER_HISTORY_SYNC_INTERVAL_MS) {
+      return;
+    }
+    long duration = getKnownDuration();
+    long position = Math.max(0L, player.getCurrentPosition());
+    if (duration > 0L && duration - position < 2500L) {
+      position = 0L;
+    }
+    currentServerVideo.lastPositionMs = position;
+    currentServerVideo.watchedTimeMs = currentVideo.watchedTimeMs;
+    currentServerVideo.projectionMode = projectionMode;
+    if (duration > 0L) {
+      currentServerVideo.durationMs = duration;
+    }
+    upsertServerPlayedVideo(currentServerVideo);
+    queueServerHistorySync(currentServerVideo, false);
+    lastServerHistorySyncElapsedMs = now;
+  }
+
+  private void queueServerHistorySync(ServerVideo video, boolean played) {
+    String serverUrl = normalizeServerUrl(settingsPreferences.getString(PREF_SERVER_URL, ""));
+    if (serverUrl.length() == 0) {
+      AppLog.w(TAG, "Cannot queue server history without a server URL");
+      return;
+    }
+    try {
+      JSONObject payload = new JSONObject();
+      payload.put("position_ms", video.lastPositionMs);
+      payload.put("watched_ms", video.watchedTimeMs);
+      payload.put("duration_ms", video.durationMs);
+      payload.put("projection_mode", video.projectionMode);
+      payload.put("loop_start_ms", video.loopStartMs == C.TIME_UNSET ? JSONObject.NULL : video.loopStartMs);
+      payload.put("loop_end_ms", video.loopEndMs == C.TIME_UNSET ? JSONObject.NULL : video.loopEndMs);
+
+      JSONObject pendingItem = new JSONObject();
+      pendingItem.put("server_url", serverUrl);
+      pendingItem.put("video_id", video.id);
+      pendingItem.put("played", played);
+      pendingItem.put("token", System.currentTimeMillis() + "-" + System.nanoTime());
+      pendingItem.put("payload", payload);
+      synchronized (serverHistoryPendingLock) {
+        JSONObject pending = loadPendingServerHistory();
+        pending.put(video.id, pendingItem);
+        settingsPreferences.edit().putString(PREF_SERVER_HISTORY_PENDING, pending.toString()).commit();
       }
+      submitPendingServerHistorySync(pendingItem);
+    } catch (JSONException e) {
+      AppLog.w(TAG, "Could not queue server history update: id=" + video.id, e);
+    }
+  }
+
+  private void flushPendingServerHistorySyncs() {
+    JSONObject pending;
+    synchronized (serverHistoryPendingLock) {
+      pending = loadPendingServerHistory();
+    }
+    JSONArray names = pending.names();
+    if (names == null) {
+      return;
+    }
+    for (int i = 0; i < names.length(); i++) {
+      JSONObject pendingItem = pending.optJSONObject(names.optString(i));
+      if (pendingItem != null) {
+        submitPendingServerHistorySync(pendingItem);
+      }
+    }
+  }
+
+  private JSONObject loadPendingServerHistory() {
+    try {
+      return new JSONObject(settingsPreferences.getString(PREF_SERVER_HISTORY_PENDING, "{}"));
+    } catch (JSONException e) {
+      AppLog.w(TAG, "Could not parse pending server history; preserving raw preference", e);
+      return new JSONObject();
+    }
+  }
+
+  private void submitPendingServerHistorySync(JSONObject pendingItem) {
+    serverHistoryExecutor.execute(() -> {
+      String videoId = pendingItem.optString("video_id", "");
+      String token = pendingItem.optString("token", "");
+      String serverUrl = pendingItem.optString("server_url", "");
+      JSONObject payload = pendingItem.optJSONObject("payload");
+      if (videoId.length() == 0 || token.length() == 0 || serverUrl.length() == 0 || payload == null) {
+        AppLog.w(TAG, "Skipping invalid pending server history item");
+        return;
+      }
+      try {
+        String endpoint = serverUrl + "/videos/" + videoId + "/history?played="
+            + pendingItem.optBoolean("played", false);
+        executeServerHistoryRequest("PUT", endpoint, payload.toString());
+        synchronized (serverHistoryPendingLock) {
+          JSONObject pending = loadPendingServerHistory();
+          JSONObject current = pending.optJSONObject(videoId);
+          if (current != null && token.equals(current.optString("token", ""))) {
+            pending.remove(videoId);
+            settingsPreferences.edit().putString(PREF_SERVER_HISTORY_PENDING, pending.toString()).commit();
+          }
+        }
+      } catch (IOException e) {
+        AppLog.w(TAG, "Server history sync failed; update remains queued: id=" + videoId, e);
+      }
+    });
+  }
+
+  private void queueClearServerHistory() {
+    String serverUrl = normalizeServerUrl(settingsPreferences.getString(PREF_SERVER_URL, ""));
+    if (serverUrl.length() == 0) {
+      return;
+    }
+    serverHistoryExecutor.execute(() -> {
+      try {
+        executeServerHistoryRequest("DELETE", serverUrl + "/history", null);
+      } catch (IOException e) {
+        AppLog.w(TAG, "Could not clear server history", e);
+        uiHandler.post(() -> setServerDialogStatus("Could not clear server history"));
+      }
+    });
+  }
+
+  private void executeServerHistoryRequest(String method, String endpoint, String body) throws IOException {
+    HttpURLConnection connection = (HttpURLConnection) new URL(endpoint).openConnection();
+    connection.setRequestMethod(method);
+    connection.setConnectTimeout(8000);
+    connection.setReadTimeout(15000);
+    setServerApiKeyHeader(connection);
+    if (body != null) {
+      byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+      connection.setDoOutput(true);
+      connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+      connection.setFixedLengthStreamingMode(bytes.length);
+      try (OutputStream output = connection.getOutputStream()) {
+        output.write(bytes);
+      }
+    }
+    int statusCode = connection.getResponseCode();
+    InputStream stream = statusCode >= 200 && statusCode < 300
+        ? connection.getInputStream()
+        : connection.getErrorStream();
+    String responseBody = readFully(stream);
+    connection.disconnect();
+    if (statusCode < 200 || statusCode >= 300) {
+      throw new IOException("HTTP " + statusCode + (responseBody.length() > 0 ? ": " + responseBody : ""));
     }
   }
 
@@ -2830,6 +2970,10 @@ public class MainActivity extends AppCompatActivity {
 
   private boolean hasServerWatchHistory(ServerVideo video) {
     return findServerVideo(serverPlayedVideos, video.id) != null;
+  }
+
+  private String latestServerHistoryId() {
+    return serverPlayedVideos.isEmpty() ? "" : serverPlayedVideos.get(0).id;
   }
 
   private static long parseModifiedMillis(String value) {
@@ -3205,12 +3349,14 @@ public class MainActivity extends AppCompatActivity {
   private static final class ServerVideoLoadResult {
     final String serverUrl;
     final List<ServerVideo> videos;
+    final List<ServerVideo> playedVideos;
     final boolean refreshing;
     final long cacheAgeSeconds;
 
-    ServerVideoLoadResult(String serverUrl, List<ServerVideo> videos, boolean refreshing, long cacheAgeSeconds) {
+    ServerVideoLoadResult(String serverUrl, List<ServerVideo> videos, List<ServerVideo> playedVideos, boolean refreshing, long cacheAgeSeconds) {
       this.serverUrl = serverUrl;
       this.videos = videos;
+      this.playedVideos = playedVideos;
       this.refreshing = refreshing;
       this.cacheAgeSeconds = cacheAgeSeconds;
     }
@@ -3227,10 +3373,13 @@ public class MainActivity extends AppCompatActivity {
     long durationMs;
     final long modifiedMs;
     final String fileDate;
+    final String searchText;
     boolean flaggedForDeletion;
     long lastPositionMs;
     long watchedTimeMs;
     int projectionMode;
+    long loopStartMs;
+    long loopEndMs;
 
     ServerVideo(
         String id,
@@ -3246,7 +3395,9 @@ public class MainActivity extends AppCompatActivity {
         boolean flaggedForDeletion,
         long lastPositionMs,
         long watchedTimeMs,
-        int projectionMode) {
+        int projectionMode,
+        long loopStartMs,
+        long loopEndMs) {
       this.id = id;
       this.title = title;
       this.fileName = fileName;
@@ -3257,10 +3408,13 @@ public class MainActivity extends AppCompatActivity {
       this.durationMs = durationMs;
       this.modifiedMs = modifiedMs;
       this.fileDate = fileDate.length() == 0 ? formatFileDate(modifiedMs) : fileDate;
+      this.searchText = SearchMatcher.normalize(displayTitle() + " " + this.fileDate);
       this.flaggedForDeletion = flaggedForDeletion;
       this.lastPositionMs = lastPositionMs;
       this.watchedTimeMs = watchedTimeMs;
       this.projectionMode = sanitizeProjectionMode(projectionMode);
+      this.loopStartMs = loopStartMs;
+      this.loopEndMs = loopEndMs;
     }
 
     String displayTitle() {
@@ -3282,7 +3436,9 @@ public class MainActivity extends AppCompatActivity {
           flaggedForDeletion,
           lastPositionMs,
           watchedTimeMs,
-          projectionMode
+          projectionMode,
+          loopStartMs,
+          loopEndMs
       );
     }
   }

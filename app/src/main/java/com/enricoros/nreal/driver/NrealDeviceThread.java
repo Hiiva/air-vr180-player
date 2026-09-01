@@ -9,9 +9,7 @@ import android.util.Pair;
 import com.enricoros.nreal.AppLog;
 import com.enricoros.nreal.driver.data.MagnetometerPreprocessor;
 
-import org.json.JSONArray;
 import org.json.JSONException;
-import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
@@ -35,10 +33,9 @@ class NrealDeviceThread extends Thread {
   private static final int IMU_COMMAND_TIMEOUT_MS = 500;
   private static final int MAX_FACTORY_CONFIG_BYTES = 128 * 1024;
 
-  // constants from the datasheets
+  // Constants from the datasheets, retained for the optional debug display.
   private static final float TICK_SCALE_S = 1f / 1E9f;
-  private static final float GYRO_SCALE_DPS = 2000f / 8388608f; // based on 24bit signed int w/ FSR = +/-2000 dps, datasheet option
-  private static final float ACCEL_SCALE_G = 16f / 8388608f;    // based on 24bit signed int w/ FSR = +/-16 g, datasheet option
+  private static final float DEFAULT_SAMPLE_PERIOD_S = 0.001f;
 
   private final UsbDeviceConnection connection;
   private final UsbEndpoint imuIn;
@@ -49,9 +46,12 @@ class NrealDeviceThread extends Thread {
   private final byte[] imuData = new byte[64];
   private final byte[] otherData = new byte[64];
   private final ImuDataRaw imuDataRaw = new ImuDataRaw();
-  private final MagnetometerPreprocessor magnetometerPreprocessor = new MagnetometerPreprocessor(100.f, 200);
-
-  private final float[] gyroCalibrationRadiansPerSecond = new float[3];
+  private final MagnetometerPreprocessor magnetometerPreprocessor =
+      new MagnetometerPreprocessor(20.0f, 200.0f);
+  private final FactoryImuCalibration factoryImuCalibration = new FactoryImuCalibration();
+  private final float[] calibratedAccelerationGs = new float[3];
+  private final float[] calibratedGyroscopeRadiansPerSecond = new float[3];
+  private final float[] calibratedMagnetometer = new float[3];
 
   private boolean mQuit = false;
 
@@ -94,25 +94,32 @@ class NrealDeviceThread extends Thread {
 
 
   public void saveState(SharedPreferences preferences) {
-    int[] calibration = magnetometerPreprocessor.saveCalibration();
+    float[] calibration = magnetometerPreprocessor.saveCalibration();
     if (calibration != null) {
       AppLog.d(TAG, () -> "Saving magnetometer calibration: values=" + Arrays.toString(calibration));
-      preferences.edit().putString("magnetometer_calibration", Arrays.toString(calibration)).apply();
+      preferences.edit()
+          .putString("magnetometer_calibration_v2", Arrays.toString(calibration))
+          .apply();
     } else {
       AppLog.d(TAG, "No magnetometer calibration available to save");
     }
   }
 
   public boolean restoreState(SharedPreferences preferences) {
-    String calibration = preferences.getString("magnetometer_calibration", null);
+    String calibration = preferences.getString("magnetometer_calibration_v2", null);
     if (calibration != null) {
-      String[] split = calibration.substring(1, calibration.length() - 1).split(", ");
-      int[] ints = new int[split.length];
-      for (int i = 0; i < split.length; i++)
-        ints[i] = Integer.parseInt(split[i]);
-      magnetometerPreprocessor.restoreCalibration(ints);
-      AppLog.i(TAG, () -> "Restored magnetometer calibration: count=" + ints.length);
-      return true;
+      try {
+        String[] split = calibration.substring(1, calibration.length() - 1).split(", ");
+        float[] values = new float[split.length];
+        for (int i = 0; i < split.length; i++) {
+          values[i] = Float.parseFloat(split[i]);
+        }
+        magnetometerPreprocessor.restoreCalibration(values);
+        AppLog.i(TAG, () -> "Restored magnetometer calibration: count=" + values.length);
+        return true;
+      } catch (RuntimeException e) {
+        AppLog.w(TAG, "Ignoring invalid saved magnetometer calibration", e);
+      }
     }
     AppLog.d(TAG, "No magnetometer calibration state to restore");
     return false;
@@ -190,40 +197,67 @@ class NrealDeviceThread extends Thread {
     int accelY = (imuData[36] & 0xFF) | ((imuData[37] & 0xFF) << 8) | ((imuData[38] & 0xFF) << 16) | ((imuData[38] & 0x80) != 0 ? (0xFF << 24) : 0);
     int accelZ = (imuData[39] & 0xFF) | ((imuData[40] & 0xFF) << 8) | ((imuData[41] & 0xFF) << 16) | ((imuData[41] & 0x80) != 0 ? (0xFF << 24) : 0);
     // [42 ... 47] = 00 80 00 04 00 00
-    int magX = (imuData[48] & 0xFF) | ((imuData[49] & 0xFF) << 8);
-    int magY = (imuData[50] & 0xFF) | ((imuData[51] & 0xFF) << 8);
-    int magZ = (imuData[52] & 0xFF) | ((imuData[53] & 0xFF) << 8);
+    int magX = readLeInt16(imuData, 48);
+    int magY = readLeInt16(imuData, 50);
+    int magZ = readLeInt16(imuData, 52);
     //int counter2 = (imuData[54] & 0xFF) | ((imuData[55] & 0xFF) << 8) | ((imuData[56] & 0xFF) << 16) | ((imuData[57] & 0xFF) << 24);
     // [58 ... 63] = 00 00 00 00 (00 | 01) 00
     if (imuData[58] != 0 || imuData[59] != 0 || imuData[60] != 0 || imuData[61] != 0 || (imuData[62] != 0 && imuData[62] != 1) || imuData[63] != 0)
       printHex(imuData, 58, 6, "Unexpected IMU data (2): ");
 
-    // call the callback
-    imuDataRaw.update(accelX, accelY, accelZ, angVelX, angVelY, angVelZ, magX, magY, magZ, uptimeNs, gyroCalibrationRadiansPerSecond);
-
-    // DATA PROCESSING
-
-    // Integrate information, if we have a previous time
-    if (lastUptimeNs < 1) {
-      lastUptimeNs = uptimeNs;
-      return;
-    }
-    float dT = (uptimeNs - lastUptimeNs) * TICK_SCALE_S;
+    float dT = lastUptimeNs > 0L
+        ? (uptimeNs - lastUptimeNs) * TICK_SCALE_S
+        : DEFAULT_SAMPLE_PERIOD_S;
     lastUptimeNs = uptimeNs;
+    if (!Float.isFinite(dT) || dT <= 0.0f || dT > 0.1f) {
+      dT = DEFAULT_SAMPLE_PERIOD_S;
+    }
 
-    // Normalize the data for the 3DoF
-    float dRoll = (float) (angVelX) * GYRO_SCALE_DPS;
-    float dPitch = (float) (angVelY) * GYRO_SCALE_DPS;
-    float dYaw = (float) (angVelZ) * GYRO_SCALE_DPS;
-    float aX = (float) (accelX) * ACCEL_SCALE_G;
-    float aY = (float) (accelY) * ACCEL_SCALE_G;
-    float aZ = (float) (accelZ) * ACCEL_SCALE_G;
-    float[] mag = magnetometerPreprocessor.process(magX, magY, magZ, dT);
+    factoryImuCalibration.calibrateAccelerometer(
+        accelX, accelY, accelZ, calibratedAccelerationGs);
+    factoryImuCalibration.calibrateGyroscope(
+        angVelX, angVelY, angVelZ, calibratedGyroscopeRadiansPerSecond);
+    factoryImuCalibration.calibrateMagnetometer(
+        magX, magY, magZ, calibratedMagnetometer);
+    boolean hasFactoryMagnetometerCalibration =
+        factoryImuCalibration.isMagnetometerCalibrated();
+    float[] magnetometerDirection = magnetometerPreprocessor.process(
+        calibratedMagnetometer[0],
+        calibratedMagnetometer[1],
+        calibratedMagnetometer[2],
+        dT,
+        !hasFactoryMagnetometerCalibration);
+
+    imuDataRaw.update(
+        accelX,
+        accelY,
+        accelZ,
+        angVelX,
+        angVelY,
+        angVelZ,
+        magX,
+        magY,
+        magZ,
+        uptimeNs,
+        calibratedAccelerationGs,
+        calibratedGyroscopeRadiansPerSecond,
+        magnetometerDirection,
+        magnetometerPreprocessor.getLastFieldMagnitude(),
+        hasFactoryMagnetometerCalibration
+            || magnetometerPreprocessor.isCalibrationReady());
 
     if (DEBUG_IMU_TEXT) {
-      // convert dRoll to string with 2 decimal places
       imuDataRaw.update(String.format("\n\nGyro (dps):  %+,.1f  %+,.1f  %+,.1f\n\nAcc    (G):  %+,.1f  %+,.1f  %+,.1f\n\nMag (norm):  %.3f  %.3f  %.3f\n\ndT (ms):  %3.0f",
-          dRoll, dPitch, dYaw, aX, aY, aZ, mag[0], mag[1], mag[2], dT * 1000));
+          Math.toDegrees(calibratedGyroscopeRadiansPerSecond[0]),
+          Math.toDegrees(calibratedGyroscopeRadiansPerSecond[1]),
+          Math.toDegrees(calibratedGyroscopeRadiansPerSecond[2]),
+          calibratedAccelerationGs[0],
+          calibratedAccelerationGs[1],
+          calibratedAccelerationGs[2],
+          magnetometerDirection[0],
+          magnetometerDirection[1],
+          magnetometerDirection[2],
+          dT * 1000));
     }
     threadCallbacks.onNewData(imuDataRaw);
   }
@@ -257,40 +291,40 @@ class NrealDeviceThread extends Thread {
 
   private void loadFactoryCalibration() {
     try {
-      if (readFactoryGyroCalibration()) {
-        AppLog.i(TAG, "Loaded factory IMU gyro calibration");
-        threadCallbacks.onMessage("Loaded factory IMU gyro calibration");
+      if (readFactoryImuCalibration()) {
+        AppLog.i(TAG, "Loaded factory IMU calibration");
+        threadCallbacks.onMessage("Loaded factory IMU calibration");
       } else {
-        AppLog.d(TAG, "Factory IMU gyro calibration was unavailable");
+        AppLog.d(TAG, "Factory IMU calibration was unavailable");
       }
     } catch (RuntimeException e) {
       AppLog.w(TAG, "Could not load factory IMU calibration", e);
     }
   }
 
-  private boolean readFactoryGyroCalibration() {
+  private boolean readFactoryImuCalibration() {
     // Pause the IMU stream while asking the glasses for their JSON calibration blob.
-    AppLog.d(TAG, "Reading factory gyro calibration");
+    AppLog.d(TAG, "Reading factory IMU calibration");
     t_sendImuCommand(0x19, new byte[]{0x00}, IMU_COMMAND_TIMEOUT_MS);
 
     byte[] lengthBytes = t_sendImuCommand(0x14, new byte[0], IMU_COMMAND_TIMEOUT_MS);
     if (lengthBytes == null || lengthBytes.length < 4) {
-      AppLog.d(TAG, "Factory gyro calibration length response missing");
+      AppLog.d(TAG, "Factory IMU calibration length response missing");
       return false;
     }
 
     int configLength = readLe32(lengthBytes, 0);
     if (configLength <= 0 || configLength > MAX_FACTORY_CONFIG_BYTES) {
-      AppLog.w(TAG, "Factory gyro calibration length out of range: " + configLength);
+      AppLog.w(TAG, "Factory IMU calibration length out of range: " + configLength);
       return false;
     }
-    AppLog.d(TAG, () -> "Factory gyro calibration length=" + configLength);
+    AppLog.d(TAG, () -> "Factory IMU calibration length=" + configLength);
 
     ByteArrayOutputStream configBytes = new ByteArrayOutputStream(configLength);
     while (configBytes.size() < configLength) {
       byte[] chunk = t_sendImuCommand(0x15, new byte[0], IMU_COMMAND_TIMEOUT_MS);
       if (chunk == null || chunk.length == 0) {
-        AppLog.d(TAG, () -> "Factory gyro calibration chunk missing: bytesRead=" + configBytes.size()
+        AppLog.d(TAG, () -> "Factory IMU calibration chunk missing: bytesRead=" + configBytes.size()
             + ", expected=" + configLength);
         return false;
       }
@@ -298,28 +332,12 @@ class NrealDeviceThread extends Thread {
       configBytes.write(chunk, 0, bytesToWrite);
     }
 
-    return parseFactoryGyroCalibration(new String(configBytes.toByteArray(), StandardCharsets.UTF_8));
+    return parseFactoryImuCalibration(new String(configBytes.toByteArray(), StandardCharsets.UTF_8));
   }
 
-  private boolean parseFactoryGyroCalibration(String configJson) {
+  private boolean parseFactoryImuCalibration(String configJson) {
     try {
-      JSONObject config = new JSONObject(configJson);
-      JSONObject imuDevice = config.getJSONObject("IMU").getJSONObject("device_1");
-      JSONArray gyroBias = imuDevice.getJSONArray("gyro_bias");
-      if (gyroBias.length() < 3) {
-        AppLog.w(TAG, "Factory gyro calibration missing gyro_bias values");
-        return false;
-      }
-
-      // Match the axis/sign convention used by getGyroscopeRadiansPerSecond().
-      gyroCalibrationRadiansPerSecond[0] = -(float) gyroBias.getDouble(0);
-      gyroCalibrationRadiansPerSecond[1] = (float) gyroBias.getDouble(1);
-      gyroCalibrationRadiansPerSecond[2] = (float) gyroBias.getDouble(2);
-      AppLog.d(TAG, () -> "Parsed factory gyro calibration: "
-          + gyroCalibrationRadiansPerSecond[0] + ", "
-          + gyroCalibrationRadiansPerSecond[1] + ", "
-          + gyroCalibrationRadiansPerSecond[2]);
-      return true;
+      return factoryImuCalibration.load(configJson);
     } catch (JSONException e) {
       AppLog.w(TAG, "Could not parse factory IMU calibration", e);
       return false;
@@ -434,6 +452,10 @@ class NrealDeviceThread extends Thread {
 
   private static int readLe16(byte[] source, int offset) {
     return (source[offset] & 0xFF) | ((source[offset + 1] & 0xFF) << 8);
+  }
+
+  static int readLeInt16(byte[] source, int offset) {
+    return (short) readLe16(source, offset);
   }
 
   private static int readLe32(byte[] source, int offset) {

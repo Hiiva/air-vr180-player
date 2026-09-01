@@ -8,9 +8,11 @@ import os
 import re
 import shutil
 import socket
+import sqlite3
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -47,10 +49,12 @@ THUMBNAIL_DIR = CACHE_DIR / "thumbnails"
 METADATA_DIR = CACHE_DIR / "metadata"
 LIBRARY_INDEX_FILE = CACHE_DIR / "library_index.json"
 DELETION_FLAGS_FILE = CACHE_DIR / "deletion_flags.txt"
+WATCH_HISTORY_FILE = CACHE_DIR / "watch_history.sqlite3"
 THUMBNAIL_FAILURE_DIR = CACHE_DIR / "thumbnail_failures"
 THUMBNAIL_LOCKS_LOCK = threading.Lock()
 THUMBNAIL_GENERATION_LOCKS: dict[str, threading.Lock] = {}
 DELETION_FLAGS_LOCK = threading.Lock()
+WATCH_HISTORY_LOCK = threading.RLock()
 THUMBNAIL_CACHE_VERSION = "left-eye-v1"
 THUMBNAIL_KEY_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 STREAM_CHUNK_SIZE = parse_positive_int_env("STREAM_CHUNK_SIZE_BYTES", 8 * 1024 * 1024, 64 * 1024)
@@ -128,6 +132,119 @@ class LibraryIndexEntry:
 
 
 app = FastAPI(title="Air VR180 Video Server")
+
+
+def open_watch_history() -> sqlite3.Connection:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(WATCH_HISTORY_FILE, timeout=30)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=FULL")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS watch_history (
+            video_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            subfolder TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            duration_ms INTEGER NOT NULL,
+            modified_ms INTEGER NOT NULL,
+            file_date TEXT NOT NULL,
+            position_ms INTEGER NOT NULL,
+            watched_ms INTEGER NOT NULL,
+            projection_mode INTEGER NOT NULL,
+            loop_start_ms INTEGER,
+            loop_end_ms INTEGER,
+            last_played_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        )
+        """
+    )
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(watch_history)")}
+    if "loop_start_ms" not in columns:
+        connection.execute("ALTER TABLE watch_history ADD COLUMN loop_start_ms INTEGER")
+    if "loop_end_ms" not in columns:
+        connection.execute("ALTER TABLE watch_history ADD COLUMN loop_end_ms INTEGER")
+    connection.commit()
+    return connection
+
+
+@contextmanager
+def watch_history_connection() -> Iterable[sqlite3.Connection]:
+    connection = open_watch_history()
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+def non_negative_int(value: object, field: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid {field}") from exc
+    if parsed < 0:
+        raise HTTPException(status_code=400, detail=f"Invalid {field}")
+    return parsed
+
+
+def optional_non_negative_int(value: object, field: str) -> int | None:
+    return None if value is None else non_negative_int(value, field)
+
+
+def history_record_from_payload(payload: object, now_ms: int) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="History items must be objects")
+    video_file_id = str(payload.get("id", "")).strip()
+    if not re.fullmatch(r"[0-9a-f]{24}", video_file_id):
+        raise HTTPException(status_code=400, detail="Invalid video id")
+    title = str(payload.get("title", "Server video"))
+    file_name = str(payload.get("file_name", title))
+    return {
+        "video_id": video_file_id,
+        "title": title,
+        "file_name": file_name,
+        "subfolder": str(payload.get("subfolder", "")),
+        "size": non_negative_int(payload.get("size", 0), "size"),
+        "duration_ms": non_negative_int(payload.get("duration_ms", 0), "duration_ms"),
+        "modified_ms": non_negative_int(payload.get("modified_ms", 0), "modified_ms"),
+        "file_date": str(payload.get("file_date", "")),
+        "position_ms": non_negative_int(payload.get("position_ms", 0), "position_ms"),
+        "watched_ms": non_negative_int(payload.get("watched_ms", 0), "watched_ms"),
+        "projection_mode": non_negative_int(payload.get("projection_mode", 0), "projection_mode"),
+        "loop_start_ms": optional_non_negative_int(payload.get("loop_start_ms"), "loop_start_ms"),
+        "loop_end_ms": optional_non_negative_int(payload.get("loop_end_ms"), "loop_end_ms"),
+        "last_played_at_ms": non_negative_int(
+            payload.get("last_played_at_ms", now_ms), "last_played_at_ms"
+        ),
+        "updated_at_ms": now_ms,
+    }
+
+
+def insert_history_record(connection: sqlite3.Connection, record: dict[str, object]) -> None:
+    connection.execute(
+        """
+        INSERT INTO watch_history (
+            video_id, title, file_name, subfolder, size, duration_ms, modified_ms,
+            file_date, position_ms, watched_ms, projection_mode, loop_start_ms,
+            loop_end_ms, last_played_at_ms, updated_at_ms
+        ) VALUES (
+            :video_id, :title, :file_name, :subfolder, :size, :duration_ms, :modified_ms,
+            :file_date, :position_ms, :watched_ms, :projection_mode, :loop_start_ms,
+            :loop_end_ms, :last_played_at_ms, :updated_at_ms
+        )
+        """,
+        record,
+    )
+
+
+def read_watch_history() -> list[dict[str, object]]:
+    with WATCH_HISTORY_LOCK, watch_history_connection() as connection:
+        rows = connection.execute(
+            "SELECT * FROM watch_history ORDER BY last_played_at_ms DESC, video_id"
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def get_api_key() -> str:
@@ -236,38 +353,40 @@ def normalize_path_text(path: Path) -> str:
     return str(path.resolve())
 
 
-def read_deletion_flags(clean_missing: bool = False) -> set[str]:
+def read_deletion_flags(clean_missing: bool = False) -> list[str]:
     if not DELETION_FLAGS_FILE.exists():
-        return set()
+        return []
 
     try:
         lines = DELETION_FLAGS_FILE.read_text(encoding="utf-8").splitlines()
     except OSError:
-        return set()
+        return []
 
-    flagged_paths: set[str] = set()
+    flagged_paths: list[str] = []
+    seen_paths: set[str] = set()
     changed = False
     for line in lines:
         path_text = line.strip()
         if not path_text:
             changed = True
             continue
-        if path_text in flagged_paths:
+        if path_text in seen_paths:
             changed = True
             continue
         if clean_missing and not Path(path_text).exists():
             changed = True
             continue
-        flagged_paths.add(path_text)
+        seen_paths.add(path_text)
+        flagged_paths.append(path_text)
 
     if changed:
         write_deletion_flags(flagged_paths)
     return flagged_paths
 
 
-def write_deletion_flags(flagged_paths: set[str]) -> None:
+def write_deletion_flags(flagged_paths: Iterable[str]) -> None:
     DELETION_FLAGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    content = "".join(f"{path_text}\n" for path_text in sorted(flagged_paths, key=str.lower))
+    content = "".join(f"{path_text}\n" for path_text in flagged_paths)
     DELETION_FLAGS_FILE.write_text(content, encoding="utf-8")
 
 
@@ -551,8 +670,11 @@ def background_library_refresh() -> None:
 
 
 def video_list_response(request: Request, videos: list[VideoFile], source: str) -> dict[str, object]:
+    history = read_watch_history()
+    videos_by_id = {video.id: video for video in videos}
     response: dict[str, object] = {
         "videos": [public_video(request, video) for video in videos],
+        "history": [public_history_video(request, item, videos_by_id) for item in history],
         "source": source,
         "refreshing": library_refresh_is_running(),
         "cache_age_seconds": library_cache_age_seconds(),
@@ -581,7 +703,7 @@ def video_path_is_settled(path: Path) -> bool:
         return False
 
 
-def entry_to_video(entry: LibraryIndexEntry, flags: set[str]) -> VideoFile:
+def entry_to_video(entry: LibraryIndexEntry, flags: list[str]) -> VideoFile:
     path = Path(entry.path_text)
     return VideoFile(
         id=entry.id,
@@ -709,6 +831,46 @@ def public_video(request: Request, video: VideoFile) -> dict[str, object]:
     }
 
 
+def public_history_video(
+    request: Request,
+    history: dict[str, object],
+    videos_by_id: dict[str, VideoFile],
+) -> dict[str, object]:
+    video_file_id = str(history["video_id"])
+    video = videos_by_id.get(video_file_id)
+    if video is not None:
+        item = public_video(request, video)
+    else:
+        api_key = get_api_key()
+        stream_url = str(request.url_for("stream_video", video_file_id=video_file_id))
+        item = {
+            "id": video_file_id,
+            "title": history["title"],
+            "file_name": history["file_name"],
+            "subfolder": history["subfolder"],
+            "size": history["size"],
+            "duration_ms": history["duration_ms"],
+            "modified": "",
+            "file_date": history["file_date"],
+            "flagged_for_deletion": False,
+            "stream_url": f"{stream_url}?api_key={api_key}",
+            "thumbnail_url": "",
+        }
+    item.update(
+        {
+            "available": video is not None,
+            "position_ms": history["position_ms"],
+            "watched_ms": history["watched_ms"],
+            "projection_mode": history["projection_mode"],
+            "loop_start_ms": history["loop_start_ms"],
+            "loop_end_ms": history["loop_end_ms"],
+            "last_played_at_ms": history["last_played_at_ms"],
+            "updated_at_ms": history["updated_at_ms"],
+        }
+    )
+    return item
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -737,6 +899,67 @@ def list_videos(
     if os.getenv("GENERATE_THUMBNAILS_BEFORE_LIST", "1") != "0":
         ensure_thumbnails_ready(videos)
     return video_list_response(request, videos, "scan")
+
+
+@app.get("/history")
+def get_history(request: Request) -> dict[str, object]:
+    require_api_key(request.headers.get("x-api-key"), request.query_params.get("api_key"))
+    videos = cached_library_videos() or []
+    videos_by_id = {video.id: video for video in videos}
+    history = read_watch_history()
+    return {
+        "history": [public_history_video(request, item, videos_by_id) for item in history],
+        "count": len(history),
+    }
+
+
+@app.put("/videos/{video_file_id}/history")
+async def update_history(video_file_id: str, request: Request, played: bool = Query(default=False)) -> dict[str, object]:
+    require_api_key(request.headers.get("x-api-key"), request.query_params.get("api_key"))
+    video = find_video_or_404(video_file_id)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected a history object")
+    payload = dict(payload)
+    payload.update(
+        {
+            "id": video.id,
+            "title": video.title,
+            "file_name": video.display_name,
+            "subfolder": video.subfolder,
+            "size": video.size,
+            "duration_ms": max(video.duration_ms, non_negative_int(payload.get("duration_ms", 0), "duration_ms")),
+            "modified_ms": int(video.modified * 1000),
+            "file_date": datetime.fromtimestamp(video.modified, timezone.utc).date().isoformat(),
+        }
+    )
+    now_ms = int(time.time() * 1000)
+    record = history_record_from_payload(payload, now_ms)
+    with WATCH_HISTORY_LOCK, watch_history_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        existing = connection.execute(
+            "SELECT watched_ms, last_played_at_ms FROM watch_history WHERE video_id = ?",
+            (video_file_id,),
+        ).fetchone()
+        if existing is not None:
+            record["watched_ms"] = max(int(record["watched_ms"]), int(existing["watched_ms"]))
+            if not played:
+                record["last_played_at_ms"] = int(existing["last_played_at_ms"])
+            connection.execute("DELETE FROM watch_history WHERE video_id = ?", (video_file_id,))
+        insert_history_record(connection, record)
+        connection.commit()
+    return public_history_video(request, record, {video.id: video})
+
+
+@app.delete("/history")
+def clear_history(request: Request) -> dict[str, int]:
+    require_api_key(request.headers.get("x-api-key"), request.query_params.get("api_key"))
+    with WATCH_HISTORY_LOCK, watch_history_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        deleted = connection.execute("SELECT COUNT(*) FROM watch_history").fetchone()[0]
+        connection.execute("DELETE FROM watch_history")
+        connection.commit()
+    return {"deleted": int(deleted)}
 
 
 @app.get("/videos/{video_file_id}/stream")
@@ -1037,9 +1260,10 @@ def write_deletion_flag(path: Path, flagged: bool) -> None:
     with DELETION_FLAGS_LOCK:
         flagged_paths = read_deletion_flags(clean_missing=True)
         if flagged:
-            flagged_paths.add(path_text)
+            if path_text not in flagged_paths:
+                flagged_paths.append(path_text)
         else:
-            flagged_paths.discard(path_text)
+            flagged_paths = [flagged_path for flagged_path in flagged_paths if flagged_path != path_text]
         write_deletion_flags(flagged_paths)
 
 

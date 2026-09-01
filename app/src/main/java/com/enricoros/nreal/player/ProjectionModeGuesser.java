@@ -12,6 +12,7 @@ public final class ProjectionModeGuesser {
           + "|\\b190\\s*[-_ ]?(?:vr|fov|hfov|vfov|deg|degree|degrees|fisheye|fish(?:eye)?)\\b");
   private static final Pattern VR_200_COMPACT = Pattern.compile("\\bvr[-_ ]?200\\b|\\b200[-_ ]?vr\\b");
   private static final Pattern VR_190_COMPACT = Pattern.compile("\\bvr[-_ ]?190\\b|\\b190[-_ ]?vr\\b");
+  private static final Pattern MKX_200 = Pattern.compile("\\bmkx[-_ ]?200\\b");
 
   private ProjectionModeGuesser() {
   }
@@ -22,7 +23,9 @@ public final class ProjectionModeGuesser {
       return Vr180Renderer.PROJECTION_EQUIRECT_VR180;
     }
 
-    if (matches(FOV_200, normalized) || matches(VR_200_COMPACT, normalized)) {
+    if (matches(FOV_200, normalized)
+        || matches(VR_200_COMPACT, normalized)
+        || matches(MKX_200, normalized)) {
       return Vr180Renderer.PROJECTION_FISHEYE_VR200;
     }
     if (matches(FOV_190, normalized) || matches(VR_190_COMPACT, normalized)) {

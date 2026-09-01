@@ -40,7 +40,7 @@ final class Quaternion {
 
   void normalize() {
     float length = (float) Math.sqrt(w * w + x * x + y * y + z * z);
-    if (length < 1.0e-6f) {
+    if (!Float.isFinite(length) || length < 1.0e-6f) {
       setIdentity();
       return;
     }
@@ -75,6 +75,47 @@ final class Quaternion {
     x = wx * scale;
     y = wy * scale;
     z = wz * scale;
+  }
+
+  void setFromUnitVectors(
+      float fromX,
+      float fromY,
+      float fromZ,
+      float toX,
+      float toY,
+      float toZ) {
+    float dot = Math.max(-1.0f, Math.min(1.0f,
+        fromX * toX + fromY * toY + fromZ * toZ));
+    if (dot < -0.999999f) {
+      // The vectors are opposite. Pick a stable axis perpendicular to the source.
+      if (Math.abs(fromX) < Math.abs(fromZ)) {
+        x = 0.0f;
+        y = -fromZ;
+        z = fromY;
+      } else {
+        x = -fromY;
+        y = fromX;
+        z = 0.0f;
+      }
+      w = 0.0f;
+      normalize();
+      return;
+    }
+
+    w = 1.0f + dot;
+    x = fromY * toZ - fromZ * toY;
+    y = fromZ * toX - fromX * toZ;
+    z = fromX * toY - fromY * toX;
+    normalize();
+  }
+
+  void rotate(float vx, float vy, float vz, float[] out) {
+    float tx = 2.0f * (y * vz - z * vy);
+    float ty = 2.0f * (z * vx - x * vz);
+    float tz = 2.0f * (x * vy - y * vx);
+    out[0] = vx + w * tx + (y * tz - z * ty);
+    out[1] = vy + w * ty + (z * tx - x * tz);
+    out[2] = vz + w * tz + (x * ty - y * tx);
   }
 
   void inverseRotate(float vx, float vy, float vz, float[] out) {

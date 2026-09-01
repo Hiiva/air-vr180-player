@@ -105,33 +105,6 @@ http://192.168.1.20:50050
 Then set the server API key in the Android app to the same value as `API_KEY`
 in `server/.env`.
 
-## HTTP And HTTPS
-
-Plain HTTP is the simplest option on a trusted home LAN. The Android app allows
-cleartext traffic because local server IPs usually do not have public
-certificates.
-
-Do not expose the included FastAPI server directly to the internet. If you host
-it outside a private LAN, put it behind a normal HTTPS reverse proxy, use a
-strong API key, and restrict access at the network or proxy layer.
-
-For local HTTPS experiments, the server can use a self-signed certificate:
-
-```dotenv
-USE_HTTPS=true
-CERT_FILE=certs/dev-cert.pem
-KEY_FILE=certs/dev-key.pem
-```
-
-Android will not trust that certificate by default. Debug builds can opt into
-trusting self-signed server certificates through ignored `local.properties`:
-
-```properties
-airVr180.trustAllServerCerts=true
-```
-
-Leave that disabled for public or shared builds.
-
 ## Use The App
 
 1. Connect the glasses to the Android device.
