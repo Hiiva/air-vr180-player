@@ -81,7 +81,8 @@ public final class ImuDataRaw {
         angVelZ * GYRO_SCALE_RADIANS_PER_SECOND,
         angVelY * GYRO_SCALE_RADIANS_PER_SECOND
     };
-    float[] magnetometer = new float[] {-magX, magZ, magY};
+    // XREAL Air-family transform=1 magnetic mapping is [sourceY, sourceZ, sourceX].
+    float[] magnetometer = new float[] {magY, magZ, magX};
     float magnitude = magnitude(magnetometer[0], magnetometer[1], magnetometer[2]);
     if (magnitude > 1.0e-6f) {
       magnetometer[0] /= magnitude;

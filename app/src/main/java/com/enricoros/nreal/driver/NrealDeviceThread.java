@@ -7,8 +7,6 @@ import android.hardware.usb.UsbEndpoint;
 import android.util.Pair;
 
 import com.enricoros.nreal.AppLog;
-import com.enricoros.nreal.driver.data.MagnetometerPreprocessor;
-
 import org.json.JSONException;
 
 import java.io.ByteArrayOutputStream;
@@ -46,12 +44,10 @@ class NrealDeviceThread extends Thread {
   private final byte[] imuData = new byte[64];
   private final byte[] otherData = new byte[64];
   private final ImuDataRaw imuDataRaw = new ImuDataRaw();
-  private final MagnetometerPreprocessor magnetometerPreprocessor =
-      new MagnetometerPreprocessor(20.0f, 200.0f);
   private final FactoryImuCalibration factoryImuCalibration = new FactoryImuCalibration();
   private final float[] calibratedAccelerationGs = new float[3];
   private final float[] calibratedGyroscopeRadiansPerSecond = new float[3];
-  private final float[] calibratedMagnetometer = new float[3];
+  private final float[] freshMagnetometerDirection = new float[3];
 
   private boolean mQuit = false;
 
@@ -94,34 +90,15 @@ class NrealDeviceThread extends Thread {
 
 
   public void saveState(SharedPreferences preferences) {
-    float[] calibration = magnetometerPreprocessor.saveCalibration();
-    if (calibration != null) {
-      AppLog.d(TAG, () -> "Saving magnetometer calibration: values=" + Arrays.toString(calibration));
-      preferences.edit()
-          .putString("magnetometer_calibration_v2", Arrays.toString(calibration))
-          .apply();
-    } else {
-      AppLog.d(TAG, "No magnetometer calibration available to save");
-    }
+    // Magnetic heading is intentionally not part of pose fusion. Remove calibration state from
+    // older builds so it cannot be mistaken for an active anti-drift input.
+    preferences.edit().remove("magnetometer_calibration_v2").apply();
   }
 
   public boolean restoreState(SharedPreferences preferences) {
-    String calibration = preferences.getString("magnetometer_calibration_v2", null);
-    if (calibration != null) {
-      try {
-        String[] split = calibration.substring(1, calibration.length() - 1).split(", ");
-        float[] values = new float[split.length];
-        for (int i = 0; i < split.length; i++) {
-          values[i] = Float.parseFloat(split[i]);
-        }
-        magnetometerPreprocessor.restoreCalibration(values);
-        AppLog.i(TAG, () -> "Restored magnetometer calibration: count=" + values.length);
-        return true;
-      } catch (RuntimeException e) {
-        AppLog.w(TAG, "Ignoring invalid saved magnetometer calibration", e);
-      }
+    if (preferences.contains("magnetometer_calibration_v2")) {
+      preferences.edit().remove("magnetometer_calibration_v2").apply();
     }
-    AppLog.d(TAG, "No magnetometer calibration state to restore");
     return false;
   }
 
@@ -217,16 +194,29 @@ class NrealDeviceThread extends Thread {
         accelX, accelY, accelZ, calibratedAccelerationGs);
     factoryImuCalibration.calibrateGyroscope(
         angVelX, angVelY, angVelZ, calibratedGyroscopeRadiansPerSecond);
-    factoryImuCalibration.calibrateMagnetometer(
-        magX, magY, magZ, calibratedMagnetometer);
-    boolean hasFactoryMagnetometerCalibration =
-        factoryImuCalibration.isMagnetometerCalibrated();
-    float[] magnetometerDirection = magnetometerPreprocessor.process(
-        calibratedMagnetometer[0],
-        calibratedMagnetometer[1],
-        calibratedMagnetometer[2],
-        dT,
-        !hasFactoryMagnetometerCalibration);
+
+    // Byte 62 is the v2 report's magnetic-observation freshness flag. The XYZ values remain
+    // cached between observations, so never present cached values to the stationary detector as
+    // fresh measurements. Magnetic data is used only as a motion veto, never as a yaw reference.
+    boolean freshMagnetometer = imuData[62] == 1;
+    float freshMagnetometerMagnitude = 0.0f;
+    if (freshMagnetometer) {
+      freshMagnetometerDirection[0] = magY;
+      freshMagnetometerDirection[1] = magZ;
+      freshMagnetometerDirection[2] = magX;
+      freshMagnetometerMagnitude = (float) Math.sqrt(
+          freshMagnetometerDirection[0] * freshMagnetometerDirection[0]
+              + freshMagnetometerDirection[1] * freshMagnetometerDirection[1]
+              + freshMagnetometerDirection[2] * freshMagnetometerDirection[2]);
+      if (Float.isFinite(freshMagnetometerMagnitude) && freshMagnetometerMagnitude > 1.0e-6f) {
+        freshMagnetometerDirection[0] /= freshMagnetometerMagnitude;
+        freshMagnetometerDirection[1] /= freshMagnetometerMagnitude;
+        freshMagnetometerDirection[2] /= freshMagnetometerMagnitude;
+      } else {
+        freshMagnetometer = false;
+        freshMagnetometerMagnitude = 0.0f;
+      }
+    }
 
     imuDataRaw.update(
         accelX,
@@ -241,22 +231,21 @@ class NrealDeviceThread extends Thread {
         uptimeNs,
         calibratedAccelerationGs,
         calibratedGyroscopeRadiansPerSecond,
-        magnetometerDirection,
-        magnetometerPreprocessor.getLastFieldMagnitude(),
-        hasFactoryMagnetometerCalibration
-            || magnetometerPreprocessor.isCalibrationReady());
+        freshMagnetometer ? freshMagnetometerDirection : null,
+        freshMagnetometerMagnitude,
+        false);
 
     if (DEBUG_IMU_TEXT) {
-      imuDataRaw.update(String.format("\n\nGyro (dps):  %+,.1f  %+,.1f  %+,.1f\n\nAcc    (G):  %+,.1f  %+,.1f  %+,.1f\n\nMag (norm):  %.3f  %.3f  %.3f\n\ndT (ms):  %3.0f",
+      imuDataRaw.update(String.format("\n\nGyro (dps):  %+,.1f  %+,.1f  %+,.1f\n\nAcc    (G):  %+,.1f  %+,.1f  %+,.1f\n\nMag (raw):   %d  %d  %d\n\ndT (ms):  %3.0f",
           Math.toDegrees(calibratedGyroscopeRadiansPerSecond[0]),
           Math.toDegrees(calibratedGyroscopeRadiansPerSecond[1]),
           Math.toDegrees(calibratedGyroscopeRadiansPerSecond[2]),
           calibratedAccelerationGs[0],
           calibratedAccelerationGs[1],
           calibratedAccelerationGs[2],
-          magnetometerDirection[0],
-          magnetometerDirection[1],
-          magnetometerDirection[2],
+          magX,
+          magY,
+          magZ,
           dT * 1000));
     }
     threadCallbacks.onNewData(imuDataRaw);

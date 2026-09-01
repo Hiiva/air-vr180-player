@@ -3,8 +3,14 @@ package com.enricoros.nreal.player;
 import com.enricoros.nreal.driver.ImuDataRaw;
 
 /**
- * Drift-bounded 9-axis head tracker with automatic startup centering, online gyro bias
- * estimation, magnetic disturbance rejection, and seamless magnetic re-locking.
+ * Six-axis head tracker using the glasses gyroscope for angular motion and gravity for
+ * pitch/roll stabilization.
+ *
+ * <p>Yaw is deliberately not corrected from the magnetometer. The XREAL Air family magnetic
+ * stream is sensitive to hard/soft-iron disturbances and its report-axis convention differs from
+ * gyro/accelerometer. Feeding that signal back into yaw made a changing magnetic heading look like
+ * real head motion. Long-term yaw stability is instead handled conservatively by learning residual
+ * gyroscope bias only while the glasses have been demonstrably still for a sustained period.</p>
  */
 public final class HeadTracker {
   private static final float NS_TO_SECONDS = 1.0e-9f;
@@ -16,30 +22,18 @@ public final class HeadTracker {
   private static final float ACCEL_CORRECTION_GAIN = 2.0f;
   private static final float ACCEL_REJECTION_COS = 0.81915206f; // cos(35 degrees)
 
-  private static final float STATIONARY_MIN_ACCEL_G = 0.94f;
-  private static final float STATIONARY_MAX_ACCEL_G = 1.06f;
-  private static final float STATIONARY_GYRO_WITH_MAG_RAD_PER_SECOND = 0.060f;
-  private static final float STATIONARY_GYRO_WITHOUT_MAG_RAD_PER_SECOND = 0.015f;
-  private static final float STATIONARY_HOLD_SECONDS = 0.75f;
-  private static final float STATIONARY_VECTOR_COS = 0.99994516f; // cos(0.6 degrees)
-  private static final float STATIONARY_DEADBAND_RAD_PER_SECOND = 0.010f;
-  private static final float GYRO_BIAS_TIME_CONSTANT_SECONDS = 6.0f;
-  private static final float MAX_GYRO_BIAS_RAD_PER_SECOND = 0.25f;
-
-  private static final float MAGNETIC_CORRECTION_GAIN = 1.0f;
-  private static final float MAGNETIC_STATIONARY_GAIN = 1.8f;
-  private static final float UNCALIBRATED_MAGNETIC_GAIN_SCALE = 0.30f;
-  private static final float MAX_MAGNETIC_CORRECTION_RAD_PER_SECOND = 0.45f;
-  private static final float MAGNETIC_HEADING_DEADBAND_RAD = 0.00035f;
-  private static final float MAGNETIC_REJECTION_RAD = 0.34906584f; // 20 degrees
-  private static final float MAGNETIC_HEADING_JUMP_RAD = 0.08726646f; // 5 degrees
-  private static final float MIN_CALIBRATED_FIELD_RATIO = 0.55f;
-  private static final float MAX_CALIBRATED_FIELD_RATIO = 1.80f;
-  private static final float MIN_UNCALIBRATED_FIELD_RATIO = 0.35f;
-  private static final float MAX_UNCALIBRATED_FIELD_RATIO = 2.85f;
-  private static final float MAGNETIC_REFERENCE_TIME_CONSTANT_SECONDS = 30.0f;
-  private static final float MAGNETIC_RELOCK_SECONDS = 3.0f;
-  private static final float MIN_HORIZONTAL_MAGNITUDE = 0.08f;
+  // Bias learning is deliberately conservative. It is safer to tolerate a tiny amount of
+  // genuine gyro drift than to classify a slow intentional head turn as sensor bias.
+  private static final float STATIONARY_MIN_ACCEL_G = 0.98f;
+  private static final float STATIONARY_MAX_ACCEL_G = 1.02f;
+  private static final float INITIAL_STATIONARY_GYRO_RAD_PER_SECOND = 0.0040f;
+  private static final float STATIONARY_GYRO_RAD_PER_SECOND = 0.0030f;
+  private static final float STATIONARY_HOLD_SECONDS = 2.0f;
+  private static final float STATIONARY_VECTOR_COS = 0.99999391f; // cos(0.20 degrees)
+  private static final float STATIONARY_MAG_VECTOR_COS = 0.99999848f; // cos(0.10 degrees)
+  private static final int STATIONARY_MIN_FRESH_MAG_SAMPLES = 2;
+  private static final float GYRO_BIAS_TIME_CONSTANT_SECONDS = 60.0f;
+  private static final float MAX_GYRO_BIAS_RAD_PER_SECOND = 0.035f;
 
   private final Quaternion orientation = new Quaternion();
   private final Quaternion centerCorrection = new Quaternion();
@@ -51,13 +45,10 @@ public final class HeadTracker {
   private final float[] correctedGyro = new float[3];
   private final float[] accel = new float[3];
   private final float[] accelUnit = new float[3];
-  private final float[] magnetometer = new float[3];
-  private final float[] magnetometerUnit = new float[3];
   private final float[] expectedUpInHead = new float[3];
-  private final float[] worldMagnetometer = new float[3];
-  private final float[] magneticReferenceWorld = new float[3];
   private final float[] stationaryAccelReference = new float[3];
   private final float[] stationaryMagReference = new float[3];
+  private final float[] magnetometer = new float[3];
   private final float[] stationaryGyroSum = new float[3];
   private final float[] rotationMatrix = new float[9];
 
@@ -65,28 +56,23 @@ public final class HeadTracker {
   private boolean initialized;
   private boolean pendingAutomaticCenter;
   private boolean gyroBiasInitialized;
-  private boolean magneticReferenceInitialized;
-  private boolean stationaryReferencesInitialized;
+  private boolean stationaryReferenceInitialized;
+  private boolean stationaryMagReferenceInitialized;
   private float stationaryCandidateSeconds;
   private int stationaryGyroSampleCount;
-  private float magneticFieldReference;
-  private float magneticRejectedSeconds;
-  private float filteredHeadingError;
-  private float lastAcceptedHeadingError;
-  private boolean magneticContinuityLost;
+  private int stationaryFreshMagSampleCount;
 
   public synchronized float[] update(ImuDataRaw sample) {
     sample.getGyroscopeRadiansPerSecond(gyro);
     sample.getAccelerationGs(accel);
-    sample.getMagnetometerDirection(magnetometer);
+    boolean hasFreshMagnetometer = sample.hasMagnetometer();
+    if (hasFreshMagnetometer) {
+      sample.getMagnetometerDirection(magnetometer);
+    } else {
+      zero(magnetometer);
+    }
     return updateLocked(
-        sample.getUptimeNs(),
-        gyro,
-        accel,
-        magnetometer,
-        sample.hasMagnetometer(),
-        sample.getMagnetometerFieldMagnitude(),
-        sample.isMagnetometerCalibrated());
+        sample.getUptimeNs(), gyro, accel, magnetometer, hasFreshMagnetometer);
   }
 
   /** Automatically makes the current pose the viewing origin without resetting fusion state. */
@@ -111,19 +97,15 @@ public final class HeadTracker {
     centeredOrientation.setIdentity();
     zero(gyroBias);
     zero(stationaryGyroSum);
-    zero(magneticReferenceWorld);
     gyroBiasInitialized = false;
-    magneticReferenceInitialized = false;
-    stationaryReferencesInitialized = false;
+    stationaryReferenceInitialized = false;
+    stationaryMagReferenceInitialized = false;
     initialized = false;
     pendingAutomaticCenter = true;
     stationaryCandidateSeconds = 0.0f;
     stationaryGyroSampleCount = 0;
-    magneticFieldReference = 0.0f;
-    magneticRejectedSeconds = 0.0f;
-    filteredHeadingError = 0.0f;
-    lastAcceptedHeadingError = 0.0f;
-    magneticContinuityLost = true;
+    stationaryFreshMagSampleCount = 0;
+    zero(stationaryMagReference);
     lastTimestampNs = 0L;
   }
 
@@ -131,6 +113,10 @@ public final class HeadTracker {
     return getRotationMatrixLocked();
   }
 
+  /**
+   * Test hook. Magnetic heading is permitted only as a stationary-motion veto for bias learning;
+   * it is never fed back into orientation and therefore cannot steer yaw.
+   */
   synchronized float[] updateForTest(
       long timestampNs,
       float[] gyroscopeRadiansPerSecond,
@@ -140,20 +126,14 @@ public final class HeadTracker {
       boolean magnetometerCalibrated) {
     System.arraycopy(gyroscopeRadiansPerSecond, 0, gyro, 0, 3);
     System.arraycopy(accelerationGs, 0, accel, 0, 3);
-    boolean hasMagnetometer = magnetometerDirection != null && magnetometerDirection.length >= 3;
-    if (hasMagnetometer) {
-      System.arraycopy(magnetometerDirection, 0, magnetometer, 0, 3);
-    } else {
+    boolean hasFreshMagnetometer = magnetometerDirection != null
+        && magnetometerDirection.length >= 3
+        && normalizeInto(magnetometerDirection, magnetometer) > 0.0f;
+    if (!hasFreshMagnetometer) {
       zero(magnetometer);
     }
     return updateLocked(
-        timestampNs,
-        gyro,
-        accel,
-        magnetometer,
-        hasMagnetometer,
-        magnetometerFieldMagnitude,
-        magnetometerCalibrated);
+        timestampNs, gyro, accel, magnetometer, hasFreshMagnetometer);
   }
 
   private float[] updateLocked(
@@ -161,18 +141,12 @@ public final class HeadTracker {
       float[] gyroscope,
       float[] acceleration,
       float[] magneticDirection,
-      boolean hasMagnetometer,
-      float magneticFieldMagnitude,
-      boolean magnetometerCalibrated) {
+      boolean hasFreshMagnetometer) {
     sanitizeVector(gyroscope);
     sanitizeVector(acceleration);
 
     float accelMagnitude = normalizeInto(acceleration, accelUnit);
     boolean accelValid = accelMagnitude >= MIN_ACCEL_G && accelMagnitude <= MAX_ACCEL_G;
-    boolean magValid = hasMagnetometer
-        && normalizeInto(magneticDirection, magnetometerUnit) > 0.0f
-        && Float.isFinite(magneticFieldMagnitude)
-        && magneticFieldMagnitude > 0.0f;
 
     if (!initialized) {
       if (accelValid) {
@@ -183,9 +157,6 @@ public final class HeadTracker {
         orientation.setIdentity();
       }
       orientation.normalize();
-      if (magValid) {
-        initializeMagneticReference(magnetometerUnit, magneticFieldMagnitude);
-      }
       centerCorrection.setConjugated(orientation);
       pendingAutomaticCenter = false;
       initialized = true;
@@ -201,26 +172,15 @@ public final class HeadTracker {
     }
 
     boolean stationary = updateStationaryState(
-        gyroscope, accelMagnitude, accelValid, magValid, dt);
+        gyroscope, accelMagnitude, accelValid, magneticDirection, hasFreshMagnetometer, dt);
     updateGyroBias(gyroscope, stationary, dt);
+
     for (int i = 0; i < 3; i++) {
       correctedGyro[i] = gyroscope[i] - (gyroBiasInitialized ? gyroBias[i] : 0.0f);
     }
-    if (stationary
-        && magnitude(correctedGyro[0], correctedGyro[1], correctedGyro[2])
-        < STATIONARY_DEADBAND_RAD_PER_SECOND) {
-      zero(correctedGyro);
-    }
+
 
     applyAccelerometerCorrection(correctedGyro, accelUnit, accelMagnitude, accelValid);
-    applyMagnetometerCorrection(
-        correctedGyro,
-        magnetometerUnit,
-        magValid,
-        magneticFieldMagnitude,
-        magnetometerCalibrated,
-        stationary,
-        dt);
 
     delta.setFromAngularVelocity(
         correctedGyro[0], correctedGyro[1], correctedGyro[2], dt);
@@ -235,41 +195,49 @@ public final class HeadTracker {
       float[] gyroscope,
       float accelMagnitude,
       boolean accelValid,
-      boolean magValid,
+      float[] magneticDirection,
+      boolean hasFreshMagnetometer,
       float dt) {
-    float gyroThreshold = magValid
-        ? STATIONARY_GYRO_WITH_MAG_RAD_PER_SECOND
-        : STATIONARY_GYRO_WITHOUT_MAG_RAD_PER_SECOND;
+    float biasX = gyroBiasInitialized ? gyroBias[0] : 0.0f;
+    float biasY = gyroBiasInitialized ? gyroBias[1] : 0.0f;
+    float biasZ = gyroBiasInitialized ? gyroBias[2] : 0.0f;
+    float gyroThreshold = gyroBiasInitialized
+        ? STATIONARY_GYRO_RAD_PER_SECOND
+        : INITIAL_STATIONARY_GYRO_RAD_PER_SECOND;
+
     boolean candidate = accelValid
         && accelMagnitude >= STATIONARY_MIN_ACCEL_G
         && accelMagnitude <= STATIONARY_MAX_ACCEL_G
         && magnitude(
-            gyroscope[0] - (gyroBiasInitialized ? gyroBias[0] : 0.0f),
-            gyroscope[1] - (gyroBiasInitialized ? gyroBias[1] : 0.0f),
-            gyroscope[2] - (gyroBiasInitialized ? gyroBias[2] : 0.0f)) < gyroThreshold;
+            gyroscope[0] - biasX,
+            gyroscope[1] - biasY,
+            gyroscope[2] - biasZ) < gyroThreshold;
 
     if (!candidate) {
       resetStationaryCandidate();
       return false;
     }
 
-    if (!stationaryReferencesInitialized) {
+    if (!stationaryReferenceInitialized) {
       System.arraycopy(accelUnit, 0, stationaryAccelReference, 0, 3);
-      if (magValid) {
-        System.arraycopy(magnetometerUnit, 0, stationaryMagReference, 0, 3);
-      } else {
-        zero(stationaryMagReference);
-      }
-      stationaryReferencesInitialized = true;
-    } else {
-      boolean accelMoved = dot(accelUnit, stationaryAccelReference) < STATIONARY_VECTOR_COS;
-      boolean magMoved = magValid
-          && magnitude(stationaryMagReference[0], stationaryMagReference[1], stationaryMagReference[2]) > 0.0f
-          && dot(magnetometerUnit, stationaryMagReference) < STATIONARY_VECTOR_COS;
-      if (accelMoved || magMoved) {
+      stationaryReferenceInitialized = true;
+    } else if (dot(accelUnit, stationaryAccelReference) < STATIONARY_VECTOR_COS) {
+      resetStationaryCandidate();
+      return false;
+    }
+
+    // The magnetometer is only a veto. A changing field/direction proves the glasses are not a
+    // trustworthy zero-rate sample, but the magnetic heading is never used to rotate the view.
+    // NrealDeviceThread supplies this vector only on the report's fresh-magnetic-observation flag.
+    if (hasFreshMagnetometer) {
+      if (!stationaryMagReferenceInitialized) {
+        System.arraycopy(magneticDirection, 0, stationaryMagReference, 0, 3);
+        stationaryMagReferenceInitialized = true;
+      } else if (dot(magneticDirection, stationaryMagReference) < STATIONARY_MAG_VECTOR_COS) {
         resetStationaryCandidate();
         return false;
       }
+      stationaryFreshMagSampleCount++;
     }
 
     stationaryCandidateSeconds += dt;
@@ -277,14 +245,18 @@ public final class HeadTracker {
     stationaryGyroSum[1] += gyroscope[1];
     stationaryGyroSum[2] += gyroscope[2];
     stationaryGyroSampleCount++;
-    return stationaryCandidateSeconds >= STATIONARY_HOLD_SECONDS;
+    return stationaryCandidateSeconds >= STATIONARY_HOLD_SECONDS
+        && stationaryFreshMagSampleCount >= STATIONARY_MIN_FRESH_MAG_SAMPLES;
   }
 
   private void resetStationaryCandidate() {
     stationaryCandidateSeconds = 0.0f;
     stationaryGyroSampleCount = 0;
-    stationaryReferencesInitialized = false;
+    stationaryReferenceInitialized = false;
+    stationaryMagReferenceInitialized = false;
+    stationaryFreshMagSampleCount = 0;
     zero(stationaryGyroSum);
+    zero(stationaryMagReference);
   }
 
   private void updateGyroBias(float[] gyroscope, boolean stationary, float dt) {
@@ -303,6 +275,7 @@ public final class HeadTracker {
       return;
     }
 
+    // Adapt very slowly. This is for residual temperature/bias drift, not for following head motion.
     float alpha = 1.0f - (float) Math.exp(-dt / GYRO_BIAS_TIME_CONSTANT_SECONDS);
     for (int i = 0; i < 3; i++) {
       gyroBias[i] += (gyroscope[i] - gyroBias[i]) * alpha;
@@ -326,7 +299,8 @@ public final class HeadTracker {
       return;
     }
 
-    float magnitudeWeight = 1.0f - clamp(Math.abs(accelMagnitude - 1.0f) / 0.30f, 0.0f, 1.0f);
+    float magnitudeWeight = 1.0f
+        - clamp(Math.abs(accelMagnitude - 1.0f) / 0.30f, 0.0f, 1.0f);
     // Measured cross expected gives the body-frame angular velocity that removes tilt error.
     float errorX = measuredUp[1] * expectedUpInHead[2]
         - measuredUp[2] * expectedUpInHead[1];
@@ -338,120 +312,6 @@ public final class HeadTracker {
     gyroscope[0] += errorX * gain;
     gyroscope[1] += errorY * gain;
     gyroscope[2] += errorZ * gain;
-  }
-
-  private void applyMagnetometerCorrection(
-      float[] gyroscope,
-      float[] measuredMagnetometer,
-      boolean magValid,
-      float fieldMagnitude,
-      boolean calibrated,
-      boolean stationary,
-      float dt) {
-    if (!magValid) {
-      magneticRejectedSeconds += dt;
-      filteredHeadingError = 0.0f;
-      magneticContinuityLost = true;
-      return;
-    }
-
-    if (!magneticReferenceInitialized) {
-      initializeMagneticReference(measuredMagnetometer, fieldMagnitude);
-      return;
-    }
-
-    if (!calculateWorldHorizontalMagnetometer(measuredMagnetometer, worldMagnetometer)) {
-      magneticRejectedSeconds += dt;
-      filteredHeadingError = 0.0f;
-      magneticContinuityLost = true;
-      return;
-    }
-
-    float dot = clamp(
-        worldMagnetometer[0] * magneticReferenceWorld[0]
-            + worldMagnetometer[2] * magneticReferenceWorld[2],
-        -1.0f,
-        1.0f);
-    float crossY = worldMagnetometer[2] * magneticReferenceWorld[0]
-        - worldMagnetometer[0] * magneticReferenceWorld[2];
-    float headingError = (float) Math.atan2(crossY, dot);
-
-    float fieldRatio = fieldMagnitude / Math.max(magneticFieldReference, 1.0e-6f);
-    float minFieldRatio = calibrated
-        ? MIN_CALIBRATED_FIELD_RATIO
-        : MIN_UNCALIBRATED_FIELD_RATIO;
-    float maxFieldRatio = calibrated
-        ? MAX_CALIBRATED_FIELD_RATIO
-        : MAX_UNCALIBRATED_FIELD_RATIO;
-    float headingJump = normalizeAngle(headingError - lastAcceptedHeadingError);
-    boolean accepted = fieldRatio >= minFieldRatio
-        && fieldRatio <= maxFieldRatio
-        && Math.abs(headingError) <= MAGNETIC_REJECTION_RAD
-        && (magneticContinuityLost || Math.abs(headingJump) <= MAGNETIC_HEADING_JUMP_RAD);
-
-    if (!accepted) {
-      magneticRejectedSeconds += dt;
-      filteredHeadingError = 0.0f;
-      if (stationary && magneticRejectedSeconds >= MAGNETIC_RELOCK_SECONDS) {
-        // Adopt the stable local field without rotating the current view.
-        System.arraycopy(worldMagnetometer, 0, magneticReferenceWorld, 0, 3);
-        magneticFieldReference = fieldMagnitude;
-        magneticRejectedSeconds = 0.0f;
-        lastAcceptedHeadingError = 0.0f;
-        magneticContinuityLost = false;
-      }
-      return;
-    }
-
-    magneticRejectedSeconds = 0.0f;
-    lastAcceptedHeadingError = headingError;
-    magneticContinuityLost = false;
-    float fieldAlpha = 1.0f - (float) Math.exp(
-        -dt / MAGNETIC_REFERENCE_TIME_CONSTANT_SECONDS);
-    magneticFieldReference += (fieldMagnitude - magneticFieldReference) * fieldAlpha;
-
-    float errorAlpha = 1.0f - (float) Math.exp(-dt / 0.12f);
-    filteredHeadingError += (headingError - filteredHeadingError) * errorAlpha;
-    if (Math.abs(filteredHeadingError) < MAGNETIC_HEADING_DEADBAND_RAD) {
-      return;
-    }
-
-    orientation.inverseRotate(0.0f, 1.0f, 0.0f, expectedUpInHead);
-    float gain = stationary ? MAGNETIC_STATIONARY_GAIN : MAGNETIC_CORRECTION_GAIN;
-    if (!calibrated) {
-      gain *= UNCALIBRATED_MAGNETIC_GAIN_SCALE;
-    }
-    float correctionRate = clamp(
-        filteredHeadingError * gain,
-        -MAX_MAGNETIC_CORRECTION_RAD_PER_SECOND,
-        MAX_MAGNETIC_CORRECTION_RAD_PER_SECOND);
-    gyroscope[0] += expectedUpInHead[0] * correctionRate;
-    gyroscope[1] += expectedUpInHead[1] * correctionRate;
-    gyroscope[2] += expectedUpInHead[2] * correctionRate;
-  }
-
-  private void initializeMagneticReference(float[] measuredMagnetometer, float fieldMagnitude) {
-    if (!calculateWorldHorizontalMagnetometer(measuredMagnetometer, magneticReferenceWorld)) {
-      return;
-    }
-    magneticFieldReference = fieldMagnitude;
-    magneticReferenceInitialized = true;
-    magneticRejectedSeconds = 0.0f;
-    filteredHeadingError = 0.0f;
-    lastAcceptedHeadingError = 0.0f;
-    magneticContinuityLost = false;
-  }
-
-  private boolean calculateWorldHorizontalMagnetometer(float[] measured, float[] output) {
-    orientation.rotate(measured[0], measured[1], measured[2], output);
-    output[1] = 0.0f;
-    float horizontalMagnitude = magnitude(output[0], 0.0f, output[2]);
-    if (!Float.isFinite(horizontalMagnitude) || horizontalMagnitude < MIN_HORIZONTAL_MAGNITUDE) {
-      return false;
-    }
-    output[0] /= horizontalMagnitude;
-    output[2] /= horizontalMagnitude;
-    return true;
   }
 
   private void applyPendingAutomaticCenter() {
@@ -474,15 +334,15 @@ public final class HeadTracker {
       zero(output);
       return 0.0f;
     }
-    float magnitude = magnitude(input[0], input[1], input[2]);
-    if (!Float.isFinite(magnitude) || magnitude < 1.0e-6f) {
+    float vectorMagnitude = magnitude(input[0], input[1], input[2]);
+    if (!Float.isFinite(vectorMagnitude) || vectorMagnitude < 1.0e-6f) {
       zero(output);
       return 0.0f;
     }
-    output[0] = input[0] / magnitude;
-    output[1] = input[1] / magnitude;
-    output[2] = input[2] / magnitude;
-    return magnitude;
+    output[0] = input[0] / vectorMagnitude;
+    output[1] = input[1] / vectorMagnitude;
+    output[2] = input[2] / vectorMagnitude;
+    return vectorMagnitude;
   }
 
   private static void sanitizeVector(float[] vector) {
@@ -505,16 +365,6 @@ public final class HeadTracker {
     values[0] = 0.0f;
     values[1] = 0.0f;
     values[2] = 0.0f;
-  }
-
-  private static float normalizeAngle(float angle) {
-    while (angle > Math.PI) {
-      angle -= (float) (2.0 * Math.PI);
-    }
-    while (angle < -Math.PI) {
-      angle += (float) (2.0 * Math.PI);
-    }
-    return angle;
   }
 
   private static float clamp(float value, float min, float max) {

@@ -4,7 +4,7 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
-/** Applies the calibration stored in the glasses to raw IMU measurements. */
+/** Applies the factory accelerometer and gyroscope calibration stored in the glasses. */
 final class FactoryImuCalibration {
   private static final float STANDARD_GRAVITY_METERS_PER_SECOND_SQUARED = 9.806f;
   private static final float GYRO_SCALE_RADIANS_PER_SECOND =
@@ -19,51 +19,36 @@ final class FactoryImuCalibration {
   private final float[] accelerometerSensitivity = onesVector();
   private final float[] accelerometerOffset = new float[3];
 
-  private final float[] magnetometerMisalignment = identityMatrix();
-  private final float[] magnetometerSensitivity = onesVector();
-  private final float[] magnetometerOffset = new float[3];
-
-  private final float[] calibrationFrameVector = new float[3];
+  private final float[] sourceFrameVector = new float[3];
   private final float[] scaledVector = new float[3];
-  private final float[] calibratedVector = new float[3];
+  private final float[] calibratedSourceVector = new float[3];
   private boolean loaded;
-  private boolean magnetometerCalibrated;
 
   boolean load(String configJson) throws JSONException {
     loaded = false;
-    magnetometerCalibrated = false;
     JSONObject imuDevice = new JSONObject(configJson)
         .getJSONObject("IMU")
         .getJSONObject("device_1");
 
     float[] accelBias = readVector(imuDevice, "accel_bias", zeroVector());
     float[] gyroBias = readVector(imuDevice, "gyro_bias", zeroVector());
-    float[] magBias = readVector(imuDevice, "mag_bias", zeroVector());
     float[] scaleAccel = readVector(imuDevice, "scale_accel", onesVector());
     float[] scaleGyro = readVector(imuDevice, "scale_gyro", onesVector());
-    float[] scaleMag = readVector(imuDevice, "scale_mag", onesVector());
     float[] accelToGyro = readQuaternion(imuDevice, "accel_q_gyro");
-    float[] gyroToMag = readQuaternion(imuDevice, "gyro_q_mag");
-    float[] accelToMag = multiplyQuaternions(accelToGyro, gyroToMag);
 
+    // Factory coefficients stay in the JSON component order. Calibrate in that source frame first,
+    // then apply the report/runtime axis mapping once at the end.
     quaternionToMatrix(accelToGyro, gyroscopeMisalignment);
-    quaternionToMatrix(accelToMag, magnetometerMisalignment);
     setIdentity(accelerometerMisalignment);
 
     copyValidatedSensitivity(scaleGyro, gyroscopeSensitivity);
     copyValidatedSensitivity(scaleAccel, accelerometerSensitivity);
-    copyValidatedSensitivity(scaleMag, magnetometerSensitivity);
 
     System.arraycopy(gyroBias, 0, gyroscopeOffset, 0, 3);
     for (int i = 0; i < 3; i++) {
       accelerometerOffset[i] = accelBias[i] / STANDARD_GRAVITY_METERS_PER_SECOND_SQUARED;
-      magnetometerOffset[i] = magBias[i];
     }
 
-    magnetometerCalibrated = hasValue(imuDevice, "accel_q_gyro")
-        && hasValue(imuDevice, "gyro_q_mag")
-        && hasValue(imuDevice, "mag_bias")
-        && hasValue(imuDevice, "scale_mag");
     loaded = true;
     return true;
   }
@@ -72,81 +57,55 @@ final class FactoryImuCalibration {
     return loaded;
   }
 
-  boolean isMagnetometerCalibrated() {
-    return loaded && magnetometerCalibrated;
-  }
-
   void calibrateGyroscope(int rawX, int rawY, int rawZ, float[] outputHeadAxes) {
-    transformRawToCalibrationFrame(
-        rawX * GYRO_SCALE_RADIANS_PER_SECOND,
-        rawY * GYRO_SCALE_RADIANS_PER_SECOND,
-        rawZ * GYRO_SCALE_RADIANS_PER_SECOND);
-    calibrateVector(
-        calibrationFrameVector,
+    sourceFrameVector[0] = rawX * GYRO_SCALE_RADIANS_PER_SECOND;
+    sourceFrameVector[1] = rawY * GYRO_SCALE_RADIANS_PER_SECOND;
+    sourceFrameVector[2] = rawZ * GYRO_SCALE_RADIANS_PER_SECOND;
+    calibrateSourceVector(
+        sourceFrameVector,
         gyroscopeMisalignment,
         gyroscopeSensitivity,
-        gyroscopeOffset,
-        outputHeadAxes);
+        gyroscopeOffset);
+    mapGyroAccelSourceToHead(calibratedSourceVector, outputHeadAxes);
   }
 
   void calibrateAccelerometer(int rawX, int rawY, int rawZ, float[] outputHeadAxes) {
-    transformRawToCalibrationFrame(
-        rawX * ACCEL_SCALE_G,
-        rawY * ACCEL_SCALE_G,
-        rawZ * ACCEL_SCALE_G);
-    calibrateVector(
-        calibrationFrameVector,
+    sourceFrameVector[0] = rawX * ACCEL_SCALE_G;
+    sourceFrameVector[1] = rawY * ACCEL_SCALE_G;
+    sourceFrameVector[2] = rawZ * ACCEL_SCALE_G;
+    calibrateSourceVector(
+        sourceFrameVector,
         accelerometerMisalignment,
         accelerometerSensitivity,
-        accelerometerOffset,
-        outputHeadAxes);
+        accelerometerOffset);
+    mapGyroAccelSourceToHead(calibratedSourceVector, outputHeadAxes);
   }
 
-  void calibrateMagnetometer(int rawX, int rawY, int rawZ, float[] outputHeadAxes) {
-    transformRawToCalibrationFrame(rawX, rawY, rawZ);
-    calibrateVector(
-        calibrationFrameVector,
-        magnetometerMisalignment,
-        magnetometerSensitivity,
-        magnetometerOffset,
-        outputHeadAxes);
-  }
-
-  private void transformRawToCalibrationFrame(float rawX, float rawY, float rawZ) {
-    // The factory quaternions and biases use the -X,-Z,-Y coordinate frame.
-    calibrationFrameVector[0] = -rawX;
-    calibrationFrameVector[1] = -rawZ;
-    calibrationFrameVector[2] = -rawY;
-  }
-
-  private void calibrateVector(
+  private void calibrateSourceVector(
       float[] input,
       float[] misalignment,
       float[] sensitivity,
-      float[] offset,
-      float[] outputHeadAxes) {
+      float[] offset) {
     for (int i = 0; i < 3; i++) {
       scaledVector[i] = (input[i] - offset[i]) * sensitivity[i];
     }
 
-    calibratedVector[0] = misalignment[0] * scaledVector[0]
+    calibratedSourceVector[0] = misalignment[0] * scaledVector[0]
         + misalignment[1] * scaledVector[1]
         + misalignment[2] * scaledVector[2];
-    calibratedVector[1] = misalignment[3] * scaledVector[0]
+    calibratedSourceVector[1] = misalignment[3] * scaledVector[0]
         + misalignment[4] * scaledVector[1]
         + misalignment[5] * scaledVector[2];
-    calibratedVector[2] = misalignment[6] * scaledVector[0]
+    calibratedSourceVector[2] = misalignment[6] * scaledVector[0]
         + misalignment[7] * scaledVector[1]
         + misalignment[8] * scaledVector[2];
-
-    // Convert the calibration frame to the app's right, up, back head frame.
-    outputHeadAxes[0] = calibratedVector[0];
-    outputHeadAxes[1] = -calibratedVector[1];
-    outputHeadAxes[2] = -calibratedVector[2];
   }
 
-  private static boolean hasValue(JSONObject object, String name) {
-    return object.has(name) && !object.isNull(name);
+  private static void mapGyroAccelSourceToHead(float[] source, float[] outputHeadAxes) {
+    // XREAL Air-family transform=1 gyro/accel report mapping: [-source0,+source2,+source1].
+    outputHeadAxes[0] = -source[0];
+    outputHeadAxes[1] = source[2];
+    outputHeadAxes[2] = source[1];
   }
 
   private static float[] readVector(JSONObject object, String name, float[] fallback)
@@ -182,26 +141,6 @@ final class FactoryImuCalibration {
     }
     normalizeQuaternion(quaternion);
     return quaternion;
-  }
-
-  private static float[] multiplyQuaternions(float[] lhs, float[] rhs) {
-    // Factory quaternions are stored as X,Y,Z,W.
-    float lx = lhs[0];
-    float ly = lhs[1];
-    float lz = lhs[2];
-    float lw = lhs[3];
-    float rx = rhs[0];
-    float ry = rhs[1];
-    float rz = rhs[2];
-    float rw = rhs[3];
-    float[] result = new float[] {
-        lw * rx + lx * rw + ly * rz - lz * ry,
-        lw * ry - lx * rz + ly * rw + lz * rx,
-        lw * rz + lx * ry - ly * rx + lz * rw,
-        lw * rw - lx * rx - ly * ry - lz * rz
-    };
-    normalizeQuaternion(result);
-    return result;
   }
 
   private static void quaternionToMatrix(float[] quaternion, float[] matrix) {
