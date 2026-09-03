@@ -1,0 +1,22 @@
+[package]
+name = "air-windows-player"
+version = "1.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+glow = "0.14"
+glutin = "0.32"
+glutin-winit = "0.5"
+hidapi = "2"
+libloading = "0.8"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+winit = "0.30"
+windows-sys = { version = "0.61", features = ["Win32_Devices_Display", "Win32_Foundation", "Win32_Graphics_Gdi"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

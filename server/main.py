@@ -50,6 +50,8 @@ METADATA_DIR = CACHE_DIR / "metadata"
 LIBRARY_INDEX_FILE = CACHE_DIR / "library_index.json"
 DELETION_FLAGS_FILE = CACHE_DIR / "deletion_flags.txt"
 WATCH_HISTORY_FILE = CACHE_DIR / "watch_history.sqlite3"
+SAVED_SCENES_FILE = CACHE_DIR / "saved_scenes.sqlite3"
+SAVED_SCENES_LOCK = threading.RLock()
 THUMBNAIL_FAILURE_DIR = CACHE_DIR / "thumbnail_failures"
 THUMBNAIL_LOCKS_LOCK = threading.Lock()
 THUMBNAIL_GENERATION_LOCKS: dict[str, threading.Lock] = {}
@@ -814,9 +816,8 @@ def find_video_or_404(video_file_id: str) -> VideoFile:
 
 def public_video(request: Request, video: VideoFile) -> dict[str, object]:
     api_key = get_api_key()
-    stream_url = str(request.url_for("stream_video", video_file_id=video.id))
     thumbnail_url = str(request.url_for("cached_thumbnail", thumbnail_key=thumbnail_key(video)))
-    return {
+    item: dict[str, object] = {
         "id": video.id,
         "title": video.title,
         "file_name": video.display_name,
@@ -826,9 +827,17 @@ def public_video(request: Request, video: VideoFile) -> dict[str, object]:
         "modified": datetime.fromtimestamp(video.modified, timezone.utc).isoformat(),
         "file_date": datetime.fromtimestamp(video.modified, timezone.utc).date().isoformat(),
         "flagged_for_deletion": video.flagged_for_deletion,
-        "stream_url": f"{stream_url}?api_key={api_key}",
         "thumbnail_url": f"{thumbnail_url}?api_key={api_key}",
     }
+    if request.query_params.get("client", "").strip().lower() == "windows":
+        # The Windows player runs on the same machine as this server. Give it
+        # the real local filesystem path so libmpv can read the file directly
+        # instead of needlessly looping video bytes through HTTP/TCP.
+        item["local_path"] = str(video.path.resolve())
+    else:
+        stream_url = str(request.url_for("stream_video", video_file_id=video.id))
+        item["stream_url"] = f"{stream_url}?api_key={api_key}"
+    return item
 
 
 def public_history_video(
@@ -841,8 +850,6 @@ def public_history_video(
     if video is not None:
         item = public_video(request, video)
     else:
-        api_key = get_api_key()
-        stream_url = str(request.url_for("stream_video", video_file_id=video_file_id))
         item = {
             "id": video_file_id,
             "title": history["title"],
@@ -853,9 +860,14 @@ def public_history_video(
             "modified": "",
             "file_date": history["file_date"],
             "flagged_for_deletion": False,
-            "stream_url": f"{stream_url}?api_key={api_key}",
             "thumbnail_url": "",
         }
+        if request.query_params.get("client", "").strip().lower() == "windows":
+            item["local_path"] = ""
+        else:
+            api_key = get_api_key()
+            stream_url = str(request.url_for("stream_video", video_file_id=video_file_id))
+            item["stream_url"] = f"{stream_url}?api_key={api_key}"
     item.update(
         {
             "available": video is not None,
@@ -960,6 +972,96 @@ def clear_history(request: Request) -> dict[str, int]:
         connection.execute("DELETE FROM watch_history")
         connection.commit()
     return {"deleted": int(deleted)}
+
+
+@contextmanager
+def saved_scenes_connection() -> Iterable[sqlite3.Connection]:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(SAVED_SCENES_FILE, timeout=30)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS saved_scenes (
+                video_id TEXT NOT NULL,
+                id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                start_ms INTEGER NOT NULL CHECK (start_ms >= 0),
+                end_ms INTEGER CHECK (end_ms > start_ms),
+                PRIMARY KEY (video_id, id)
+            )
+        """)
+        connection.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS saved_scene_range
+            ON saved_scenes (video_id, start_ms, COALESCE(end_ms, -1))
+        """)
+        connection.commit()
+        yield connection
+    finally:
+        connection.close()
+
+
+def authorize_scenes(request: Request, video_file_id: str, scene_id: str | None = None) -> None:
+    require_api_key(request.headers.get("x-api-key"), request.query_params.get("api_key"))
+    if not re.fullmatch(r"[0-9a-f]{24}", video_file_id):
+        raise HTTPException(status_code=400, detail="Invalid video id")
+    if scene_id is not None and not re.fullmatch(r"[0-9a-f]{32}", scene_id):
+        raise HTTPException(status_code=400, detail="Invalid scene id")
+
+
+@app.get("/videos/{video_file_id}/scenes")
+def list_saved_scenes(video_file_id: str, request: Request) -> dict[str, object]:
+    authorize_scenes(request, video_file_id)
+    with SAVED_SCENES_LOCK, saved_scenes_connection() as connection:
+        rows = connection.execute(
+            "SELECT id, name, start_ms, end_ms FROM saved_scenes WHERE video_id = ? ORDER BY start_ms, id",
+            (video_file_id,),
+        ).fetchall()
+    return {"scenes": [dict(row) for row in rows]}
+
+
+@app.put("/videos/{video_file_id}/scenes/{scene_id}")
+async def put_saved_scene(video_file_id: str, scene_id: str, request: Request) -> dict[str, object]:
+    authorize_scenes(request, video_file_id, scene_id)
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="Expected a scene object") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected a scene object")
+    name = payload.get("name", "")
+    start = payload.get("start_ms")
+    end = payload.get("end_ms")
+    if not isinstance(name, str) or len(name) > 80:
+        raise HTTPException(status_code=400, detail="Scene names must be at most 80 characters")
+    # Exact JSON integers shared by Java, Rust, SQLite and browser controllers.
+    if type(start) is not int or not 0 <= start <= 9_007_199_254_740_991:
+        raise HTTPException(status_code=400, detail="Invalid scene position")
+    if end is not None and (type(end) is not int or not start < end <= 9_007_199_254_740_991):
+        raise HTTPException(status_code=400, detail="Loop end must follow its start")
+    with SAVED_SCENES_LOCK, saved_scenes_connection() as connection:
+        try:
+            connection.execute("""
+                INSERT INTO saved_scenes (video_id, id, name, start_ms, end_ms) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(video_id, id) DO UPDATE SET
+                    name = excluded.name, start_ms = excluded.start_ms, end_ms = excluded.end_ms
+            """, (video_file_id, scene_id, name.strip(), start, end))
+            connection.commit()
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(status_code=409, detail="This scene is already saved") from exc
+    return {"id": scene_id, "name": name.strip(), "start_ms": start, "end_ms": end}
+
+
+@app.delete("/videos/{video_file_id}/scenes/{scene_id}")
+def delete_saved_scene(video_file_id: str, scene_id: str, request: Request) -> dict[str, int]:
+    authorize_scenes(request, video_file_id, scene_id)
+    with SAVED_SCENES_LOCK, saved_scenes_connection() as connection:
+        deleted = connection.execute(
+            "DELETE FROM saved_scenes WHERE video_id = ? AND id = ?", (video_file_id, scene_id)
+        ).rowcount
+        connection.commit()
+    return {"deleted": deleted}
 
 
 @app.get("/videos/{video_file_id}/stream")

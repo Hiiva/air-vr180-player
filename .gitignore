@@ -1,11 +1,13 @@
 *.iml
 .gradle
-/local.properties
+/android/local.properties
 .idea/
 .DS_Store
 AGENTS.md
-/build
-/captures
+/android/build/
+/build/
+/android/captures/
+/captures/
 .externalNativeBuild
 .cxx
 local.properties
