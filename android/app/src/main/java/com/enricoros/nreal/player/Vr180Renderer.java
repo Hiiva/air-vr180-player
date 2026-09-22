@@ -131,6 +131,7 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
   private int surfaceWidth = 1;
   private int surfaceHeight = 1;
   private long lastRenderRequestElapsedMs = 0L;
+  private long newestVideoTimestampNs = Long.MIN_VALUE;
   private float zoom = 1.0f;
   private float centerYawRadians = 0.0f;
   private float horizonPitchRadians = 0.0f;
@@ -220,6 +221,7 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
   @Override
   public void onSurfaceCreated(javax.microedition.khronos.opengles.GL10 gl, javax.microedition.khronos.egl.EGLConfig config) {
     AppLog.i(TAG, "GL surface created");
+    newestVideoTimestampNs = Long.MIN_VALUE;
     GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     program = buildProgram(VERTEX_SHADER, FRAGMENT_SHADER);
     aPosition = GLES20.glGetAttribLocation(program, "aPosition");
@@ -353,6 +355,14 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
       }
       surfaceTexture.updateTexImage();
       surfaceTexture.getTransformMatrix(videoTransforms[i]);
+      // Parallel HEVC releases both decoder surfaces in presentation order, with monotonic
+      // surface timestamps. A delayed callback from the other decoder must not replace
+      // a newer frame acquired in a previous draw.
+      long timestampNs = surfaceTexture.getTimestamp();
+      if (timestampNs >= newestVideoTimestampNs) {
+        newestVideoTimestampNs = timestampNs;
+        activeSurfaceIndex = i;
+      }
       final int surfaceIndex = i;
       mainHandler.post(() -> surfaceCallback.onVideoFrameAvailable(surfaceIndex));
     }

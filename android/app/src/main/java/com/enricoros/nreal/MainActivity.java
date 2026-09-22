@@ -63,6 +63,7 @@ import com.enricoros.nreal.databinding.ActivityMainBinding;
 import com.enricoros.nreal.driver.ImuDataRaw;
 import com.enricoros.nreal.driver.NrealManager;
 import com.enricoros.nreal.player.HeadTracker;
+import com.enricoros.nreal.player.HevcPlaybackRenderersFactory;
 import com.enricoros.nreal.player.ProjectionModeGuesser;
 import com.enricoros.nreal.player.RecentVideo;
 import com.enricoros.nreal.player.RecentVideoStore;
@@ -102,6 +103,7 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+@androidx.annotation.OptIn(markerClass = androidx.media3.common.util.UnstableApi.class)
 public class MainActivity extends AppCompatActivity {
   private static final String TAG = "AirVrPlayer";
   private static final int SEEK_BAR_MAX = 1000;
@@ -150,13 +152,14 @@ public class MainActivity extends AppCompatActivity {
   private static final int SERVER_THUMBNAIL_PREFETCH_COUNT = 24;
   private static final int PLAYER_MIN_BUFFER_MS = 15_000;
   private static final int PLAYER_MAX_BUFFER_MS = 60_000;
-  private static final int PLAYER_CONSTRAINED_MIN_BUFFER_MS = 2_500;
+  private static final int PLAYER_CONSTRAINED_MIN_BUFFER_MS = 3_000;
   private static final int PLAYER_CONSTRAINED_MAX_BUFFER_MS = 8_000;
   private static final int PLAYER_BUFFER_FOR_PLAYBACK_MS = 250;
   private static final int PLAYER_BUFFER_FOR_REBUFFER_MS = 1_000;
   private static final int PLAYER_BACK_BUFFER_MS = 30_000;
   private static final int PLAYER_CONSTRAINED_BACK_BUFFER_MS = 0;
-  private static final int PLAYER_CONSTRAINED_TARGET_BUFFER_BYTES = 48 * 1024 * 1024;
+  // Bound compressed-data buffering to leave memory available for codec output textures.
+  private static final int PLAYER_CONSTRAINED_TARGET_BUFFER_BYTES = 96 * 1024 * 1024;
   private static final long CONSTRAINED_BUFFER_MIN_BITRATE_BPS = 70_000_000L;
   private static final String[] PROJECTION_MODE_LABELS = {
       "VR180 equirectangular",
@@ -192,6 +195,8 @@ public class MainActivity extends AppCompatActivity {
   private NrealManager nrealManager;
   private ActivityMainBinding binding;
   private ExoPlayer player;
+  private final HevcPlaybackRenderersFactory.Surfaces playbackSurfaces =
+      new HevcPlaybackRenderersFactory.Surfaces();
   private boolean playerUsesConstrainedBuffers = false;
   private String playerServerApiKey = "";
   private volatile int thumbnailLoadGeneration = 0;
@@ -408,8 +413,9 @@ public class MainActivity extends AppCompatActivity {
       }
       AppLog.i(TAG, "Video surface created: index=" + surfaceIndex);
       videoSurfaces[surfaceIndex] = surface;
-      if (surfaceIndex == ACTIVE_VIDEO_SURFACE_INDEX) {
-        attachSlotSurface(player, surfaceIndex);
+      playbackSurfaces.set(surfaceIndex, surface);
+      if (videoSurfaces[0] != null && videoSurfaces[1] != null) {
+        attachSlotSurface(player, ACTIVE_VIDEO_SURFACE_INDEX);
       }
       if (presentation != null) {
         presentation.setActiveVideoSurfaceIndex(ACTIVE_VIDEO_SURFACE_INDEX);
@@ -430,6 +436,7 @@ public class MainActivity extends AppCompatActivity {
       }
       videoSurfaceAttachedSurfaces[surfaceIndex] = null;
       videoSurfaces[surfaceIndex] = null;
+      playbackSurfaces.set(surfaceIndex, null);
       updateStatus();
       updateKeepScreenOn();
     }
@@ -1315,8 +1322,8 @@ public class MainActivity extends AppCompatActivity {
 
 
   private DefaultRenderersFactory createRenderersFactory() {
-    AppLog.d(TAG, "Creating renderers factory with async codec queueing");
-    return new DefaultRenderersFactory(this).forceEnableMediaCodecAsynchronousQueueing();
+    AppLog.d(TAG, "Creating HEVC renderers factory with async codec queueing");
+    return new HevcPlaybackRenderersFactory(this, playbackSurfaces);
   }
 
   private DataSource.Factory createDataSourceFactory() {
@@ -2184,6 +2191,7 @@ public class MainActivity extends AppCompatActivity {
       }
       videoSurfaceAttachedSurfaces[i] = null;
       videoSurfaces[i] = null;
+      playbackSurfaces.set(i, null);
     }
     updateKeepScreenOn();
   }
