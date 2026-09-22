@@ -28,10 +28,10 @@ The glasses currently targeted by the USB driver use vendor/product ID
 
 - Android 11 / API 30 or newer
 - Android SDK 36
-- Android Gradle Plugin 9.2.0
+- Android Gradle Plugin 9.4.1 (configured by the project)
 - Android NDK 28.2.13676358
 - CMake 3.22.1
-- A JDK supported by the configured Android Gradle Plugin
+- JDK 17 or newer to launch the Gradle wrapper; Gradle provisions its configured JDK 25 toolchain
 - A USB-host-capable Android device
 - Xreal/Nreal Air glasses connected over USB-C with display output and HID access
 
