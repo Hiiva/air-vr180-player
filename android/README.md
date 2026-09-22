@@ -17,6 +17,7 @@ display-mode control and IMU head tracking.
 - Local playback with Media3/ExoPlayer
 - Recent files with saved resume position, watched time, and projection mode
 - Seeking, mute, and A/B loops
+- Playback speed from 0.80x to 1.20x, saved per video
 - Saved positions and saved A/B scenes
 - Optional server library browsing and HTTP streaming
 - Windows Remote mode for controlling the Windows player from the same Android UI

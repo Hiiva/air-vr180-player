@@ -109,11 +109,16 @@ public class MainActivity extends AppCompatActivity {
   private static final int SCALE_SLIDER_MAX = 180;
   private static final int SCALE_SLIDER_STEP = 5;
   private static final float DEFAULT_VIEW_SCALE = 0.80f;
+  private static final float PLAYBACK_SPEED_MIN = 0.80f;
+  private static final float PLAYBACK_SPEED_MAX = 1.20f;
+  private static final float PLAYBACK_SPEED_STEP = 0.01f;
+  private static final float DEFAULT_PLAYBACK_SPEED = 1.00f;
   private static final int SCENE_CENTER_MIN_DEGREES = -45;
   private static final int SCENE_CENTER_MAX_DEGREES = 45;
   private static final int HORIZON_MIN_DEGREES = -30;
   private static final int HORIZON_MAX_DEGREES = 30;
   private static final String PREFS_NAME = "player_settings";
+  private static final String PLAYBACK_SPEED_PREFS_NAME = "video_playback_speeds";
   private static final String PREF_AUDIO_MUTED = "audio_muted";
   private static final String PREF_VIEW_SCALE = "view_scale";
   private static final String PREF_SCENE_CENTER_DEGREES = "scene_center_degrees";
@@ -195,6 +200,7 @@ public class MainActivity extends AppCompatActivity {
   private PlayerMessage loopBoundaryMessage;
   private DisplayManager displayManager;
   private SharedPreferences settingsPreferences;
+  private SharedPreferences playbackSpeedPreferences;
   private VrPlayerPresentation presentation;
   private RecentVideo currentVideo;
   private SavedScenesController savedScenes;
@@ -216,6 +222,7 @@ public class MainActivity extends AppCompatActivity {
   private ImuDataRaw latestImuData;
   private boolean isUserSeeking = false;
   private float viewScale = DEFAULT_VIEW_SCALE;
+  private float playbackSpeed = DEFAULT_PLAYBACK_SPEED;
   private int projectionMode = Vr180Renderer.PROJECTION_EQUIRECT_VR180;
   private float sceneCenterDegrees = 0.0f;
   private float horizonDegrees = 0.0f;
@@ -243,6 +250,7 @@ public class MainActivity extends AppCompatActivity {
   private boolean activityStarted = false;
   private boolean windowsRemotePollScheduled = false;
   private boolean updatingWindowsRemoteUi = false;
+  private boolean updatingPlaybackSpeedUi = false;
   private WindowsRemoteClient.State windowsRemoteState;
   private String windowsRemoteError = "";
   private boolean localPlaybackSuspendedForWindowsRemote = false;
@@ -452,6 +460,7 @@ public class MainActivity extends AppCompatActivity {
   protected void onCreate(Bundle savedInstanceState) {
     AppLog.i(TAG, () -> "onCreate: savedState=" + (savedInstanceState != null));
     settingsPreferences = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+    playbackSpeedPreferences = getSharedPreferences(PLAYBACK_SPEED_PREFS_NAME, MODE_PRIVATE);
     installDevelopmentHttpsTrust();
     audioMuted = settingsPreferences.getBoolean(PREF_AUDIO_MUTED, false);
     viewScale = settingsPreferences.getFloat(PREF_VIEW_SCALE, DEFAULT_VIEW_SCALE);
@@ -828,6 +837,23 @@ public class MainActivity extends AppCompatActivity {
       }
     });
 
+    binding.playbackSpeedSlider.setValueFrom(PLAYBACK_SPEED_MIN * 100.0f);
+    binding.playbackSpeedSlider.setValueTo(PLAYBACK_SPEED_MAX * 100.0f);
+    binding.playbackSpeedSlider.setStepSize(PLAYBACK_SPEED_STEP * 100.0f);
+    binding.playbackSpeedSlider.setLabelFormatter(value -> formatPlaybackSpeed(value / 100.0f));
+    binding.playbackSpeedSlider.addOnChangeListener((slider, value, fromUser) -> {
+      playbackSpeed = clamp(value / 100.0f, PLAYBACK_SPEED_MIN, PLAYBACK_SPEED_MAX);
+      updatePlaybackSpeedText();
+      if (!fromUser || updatingPlaybackSpeedUi || windowsRemoteEnabled || currentVideo == null) {
+        return;
+      }
+      AppLog.i(TAG, () -> "Playback speed selected: " + formatPlaybackSpeed(playbackSpeed)
+          + ", current=" + currentVideoTitleForLog());
+      savePlaybackSpeedForCurrentVideo();
+      applyPlaybackSpeed();
+    });
+    updatePlaybackSpeedControl();
+
     binding.sceneCenterSlider.setValueFrom(SCENE_CENTER_MIN_DEGREES);
     binding.sceneCenterSlider.setValueTo(SCENE_CENTER_MAX_DEGREES);
     binding.sceneCenterSlider.setStepSize(1.0f);
@@ -993,6 +1019,7 @@ public class MainActivity extends AppCompatActivity {
     }
     binding.selectVideoButton.setText(windowsRemoteEnabled ? "Library" : "Select");
     binding.windowsFullscreenButton.setVisibility(windowsRemoteEnabled ? View.VISIBLE : View.GONE);
+    updatePlaybackSpeedControl();
     if (!windowsRemoteEnabled) {
       binding.windowsRemoteStatusText.setText("Windows remote: off");
     } else if (windowsRemoteError.length() > 0) {
@@ -1316,23 +1343,27 @@ public class MainActivity extends AppCompatActivity {
   }
 
   private void playVideo(RecentVideo video) {
+    playbackSpeed = loadPlaybackSpeed(video);
     AppLog.i(TAG, () -> "Starting playback: title=" + video.title
         + ", uri=" + video.uri
         + ", startPositionMs=" + video.lastPositionMs
         + ", durationMs=" + video.durationMs
         + ", size=" + video.size
+        + ", playbackSpeed=" + formatPlaybackSpeed(playbackSpeed)
         + ", projection=" + projectionModeName(video.projectionMode)
         + ", fromServer=" + currentVideoFromServer);
     currentVideo = video;
     resetWatchTimeTracking();
     projectionMode = sanitizeProjectionMode(video.projectionMode);
     updateProjectionModeControl();
+    updatePlaybackSpeedControl();
     playbackMessage = "";
     resetLoop();
     binding.currentVideoTitle.setText(video.title);
     preparePlayerForVideoPlayback(video);
     player.setMediaItem(MediaItem.fromUri(video.uri), Math.max(0L, video.lastPositionMs));
     player.prepare();
+    player.setPlaybackSpeed(playbackSpeed);
     player.play();
     if (currentVideoFromServer && currentServerVideo != null) {
       loopStartMs = currentServerVideo.loopStartMs;
@@ -3494,6 +3525,62 @@ public class MainActivity extends AppCompatActivity {
     if (binding.projectionModeSpinner != null) {
       binding.projectionModeSpinner.setSelection(projectionModeIndex(projectionMode), false);
     }
+  }
+
+  private float loadPlaybackSpeed(RecentVideo video) {
+    if (video == null || playbackSpeedPreferences == null) {
+      return DEFAULT_PLAYBACK_SPEED;
+    }
+    float savedSpeed = playbackSpeedPreferences.getFloat(
+        playbackSpeedPreferenceKey(video), DEFAULT_PLAYBACK_SPEED);
+    return clamp(savedSpeed, PLAYBACK_SPEED_MIN, PLAYBACK_SPEED_MAX);
+  }
+
+  private void savePlaybackSpeedForCurrentVideo() {
+    if (currentVideo == null || playbackSpeedPreferences == null) {
+      return;
+    }
+    playbackSpeedPreferences.edit()
+        .putFloat(playbackSpeedPreferenceKey(currentVideo), playbackSpeed)
+        .apply();
+  }
+
+  private String playbackSpeedPreferenceKey(RecentVideo video) {
+    if (currentVideoFromServer && currentServerVideo != null && currentServerVideo.id != null
+        && currentServerVideo.id.length() > 0) {
+      return "server:" + currentServerVideo.id;
+    }
+    return "uri:" + video.uri;
+  }
+
+  private void applyPlaybackSpeed() {
+    if (player != null) {
+      player.setPlaybackSpeed(playbackSpeed);
+    }
+  }
+
+  private void updatePlaybackSpeedControl() {
+    if (binding == null || binding.playbackSpeedSlider == null) {
+      return;
+    }
+    updatingPlaybackSpeedUi = true;
+    try {
+      binding.playbackSpeedSlider.setValue(playbackSpeed * 100.0f);
+      binding.playbackSpeedSlider.setEnabled(!windowsRemoteEnabled && currentVideo != null);
+    } finally {
+      updatingPlaybackSpeedUi = false;
+    }
+    updatePlaybackSpeedText();
+  }
+
+  private void updatePlaybackSpeedText() {
+    if (binding != null && binding.playbackSpeedValue != null) {
+      binding.playbackSpeedValue.setText(formatPlaybackSpeed(playbackSpeed));
+    }
+  }
+
+  private static String formatPlaybackSpeed(float speed) {
+    return String.format(Locale.US, "%.2fx", speed);
   }
 
   private void updateViewScaleText() {
