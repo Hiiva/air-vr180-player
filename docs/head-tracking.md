@@ -5,7 +5,31 @@ report, before `NrealManager` coalesces samples for the main-thread status UI.
 The main thread only reads an independent orientation snapshot. Button reports
 use a separate USB read loop, so their timeout cannot delay the IMU endpoint.
 
-This fixes a reproducible integration defect in the previous pipeline: a 100 ms
+The IMU endpoint keeps 512 asynchronous
+[`UsbRequest`](https://developer.android.com/reference/android/hardware/usb/UsbRequest#queue(java.nio.ByteBuffer))
+reads queued into reusable
+direct buffers (32 KiB of packet storage). This gives roughly 512 ms of headroom
+at 1000 reports/second while Java is delayed by GC or scheduling. Each completed
+report is copied and its request requeued before decoding/fusion; delivery does
+not wait for a batch to fill. All buffered reports still reach fusion in order,
+using their original device timestamps. Shutdown cancels and drains requests
+before freeing them. Command exchanges remain synchronous before streaming.
+
+This addresses a measured input-loss failure: a September 26 diagnostic recording
+contained 134 device-timestamp gaps over 50 ms (17.59 seconds in total), with
+118 within 30 ms of an app GC completion. The native orientation stayed unchanged
+across every gap. Buffering targets missing USB reports without changing VQF,
+bias tuning, recentering, or the policy for intervals that really are missing.
+Live validation on September 27 with the connected glasses covered 26 app GC
+cycles (up to 223 ms total GC time), with no new long sensor gaps after connection
+setup. Deliberately suspending app processing produced a measured 232.6 ms host
+pause while device timestamps remained 1 ms apart across the pause. The user
+reported normal movement and successfully reconnected the glasses. This verifies
+buffering for that failure mode, not every possible cause of a tracking freeze.
+Connection setup can still contain a timestamp gap before reads are queued, and
+pauses longer than the queue's headroom can still lose reports.
+
+Processing every report fixes an integration defect in the previous pipeline: a 100 ms
 UI stall during a 90-degree turn left the original tracker at 80.82 degrees.
 The missing 9.18 degrees were never recovered. UI coalescing also discarded fresh
 magnetic observations needed by the original bias estimator.

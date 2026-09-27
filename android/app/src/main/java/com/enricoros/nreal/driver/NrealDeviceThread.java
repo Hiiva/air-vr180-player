@@ -10,6 +10,7 @@ import com.enricoros.nreal.AppLog;
 import org.json.JSONException;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.zip.CRC32;
@@ -138,15 +139,18 @@ class NrealDeviceThread extends Thread {
       }
     }, "Nreal-buttons");
     buttons.start();
+    QueuedImuReader imuReader = new QueuedImuReader(connection);
     try {
+      imuReader.start(imuIn, imuData.length);
       while (!mQuit) {
-        int received = connection.bulkTransfer(imuIn, imuData, imuData.length, 200);
-        if (received < 0) {
-          if (!mQuit) threadCallbacks.onConnectionError("Could not read the IMU");
-          break;
-        }
+        int received = imuReader.read(imuData);
         // Never decode a short transfer using bytes left over from the preceding packet.
         if (received == imuData.length && !mQuit) processIMUData();
+      }
+    } catch (IOException | RuntimeException e) {
+      if (!mQuit) {
+        AppLog.w(TAG, "IMU reader failed", e);
+        threadCallbacks.onConnectionError("Could not read the IMU");
       }
     } finally {
       mQuit = true;
@@ -155,6 +159,7 @@ class NrealDeviceThread extends Thread {
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
       }
+      imuReader.close();
     }
     AppLog.i(TAG, () -> "Reader thread finished: quitRequested=" + mQuit);
   }
