@@ -110,8 +110,8 @@ public class MainActivity extends AppCompatActivity {
   private static final int SCALE_SLIDER_MAX = 180;
   private static final int SCALE_SLIDER_STEP = 5;
   private static final float DEFAULT_VIEW_SCALE = 0.80f;
-  private static final float PLAYBACK_SPEED_MIN = 0.80f;
-  private static final float PLAYBACK_SPEED_MAX = 1.20f;
+  private static final float PLAYBACK_SPEED_MIN = 0.50f;
+  private static final float PLAYBACK_SPEED_MAX = 1.50f;
   private static final float PLAYBACK_SPEED_STEP = 0.01f;
   private static final float DEFAULT_PLAYBACK_SPEED = 1.00f;
   private static final int SCENE_CENTER_MIN_DEGREES = -45;
