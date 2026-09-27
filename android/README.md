@@ -68,9 +68,9 @@ app/build/outputs/apk/debug/
 4. Tap `Recenter` after putting on the glasses.
 5. Select the correct projection mode and adjust view scale, scene center, or horizon if needed.
 
-The app requests the glasses' full-SBS display mode over USB. Android must also
-expose the glasses as an external presentation display for VR output to appear in
-the glasses.
+The app requests 3840x1080 full-SBS output at 90 Hz over USB. Availability depends
+on the connected display and Android device. Android must also expose the glasses
+as an external presentation display for VR output to appear in the glasses.
 
 Local recent entries remember playback position, watched time, duration, and the
 selected projection mode. Projection mode is also guessed from common VR190 and

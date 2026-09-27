@@ -36,6 +36,7 @@ public final class VrPlayerPresentation extends Presentation {
     }
     videoSurfaceView = new VrVideoSurfaceView(getContext(), surfaceCallback);
     setContentView(videoSurfaceView);
+    refreshOutputMode();
     videoSurfaceView.post(this::applyImmersiveMode);
   }
 
@@ -74,6 +75,10 @@ public final class VrPlayerPresentation extends Presentation {
     return videoSurfaceView != null && videoSurfaceView.isStereoOutput();
   }
 
+  public float getRenderFramesPerSecond() {
+    return videoSurfaceView == null ? 0f : videoSurfaceView.getRenderFramesPerSecond();
+  }
+
   @Override
   protected void onStart() {
     AppLog.i(TAG, () -> "onStart: displayId=" + getDisplay().getDisplayId());
@@ -102,6 +107,50 @@ public final class VrPlayerPresentation extends Presentation {
       videoSurfaceView.releaseRenderer();
       videoSurfaceView.onPause();
     }
+  }
+
+  @SuppressWarnings("deprecation")
+  public void refreshOutputMode() {
+    Window window = getWindow();
+    if (window != null) {
+      WindowManager.LayoutParams params = window.getAttributes();
+      int preferredModeId = findPreferred90HzStereoModeId();
+      if (params.preferredDisplayModeId != preferredModeId || params.preferredRefreshRate != 90f) {
+        params.preferredDisplayModeId = preferredModeId;
+        params.preferredRefreshRate = 90f;
+        AppLog.i(TAG, "Requesting 90 Hz SBS output: preferredModeId=" + preferredModeId);
+        window.setAttributes(params);
+      }
+      if (videoSurfaceView != null) videoSurfaceView.requestOutputFrameRate();
+    }
+  }
+
+  private int findPreferred90HzStereoModeId() {
+    Display display = getDisplay();
+    if (display == null) {
+      return 0;
+    }
+    Display.Mode bestMode = null;
+    float bestDelta = Float.MAX_VALUE;
+    for (Display.Mode mode : display.getSupportedModes()) {
+      if (mode.getPhysicalWidth() != 3840 || mode.getPhysicalHeight() != 1080) {
+        continue;
+      }
+      float delta = Math.abs(mode.getRefreshRate() - 90.0f);
+      if (delta < bestDelta) {
+        bestMode = mode;
+        bestDelta = delta;
+      }
+    }
+    if (bestMode == null || bestDelta > 2.0f) {
+      AppLog.w(TAG, "3840x1080 ~90 Hz mode not exposed by Android yet");
+      return 0;
+    }
+    final Display.Mode selectedMode = bestMode;
+    AppLog.i(TAG, () -> "Selected 90 Hz output mode "
+        + selectedMode.getPhysicalWidth() + "x" + selectedMode.getPhysicalHeight()
+        + " @ " + selectedMode.getRefreshRate() + " Hz, id=" + selectedMode.getModeId());
+    return selectedMode.getModeId();
   }
 
   @SuppressWarnings("deprecation")

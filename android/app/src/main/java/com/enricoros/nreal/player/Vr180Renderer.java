@@ -1,11 +1,12 @@
 package com.enricoros.nreal.player;
 
 import android.graphics.SurfaceTexture;
+import android.opengl.EGL14;
+import android.opengl.EGLExt;
 import android.opengl.GLES11Ext;
 import android.opengl.GLES20;
 import android.os.Handler;
 import android.os.Looper;
-import android.os.SystemClock;
 import android.view.Surface;
 
 import com.enricoros.nreal.AppLog;
@@ -13,6 +14,7 @@ import com.enricoros.nreal.AppLog;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
+import java.util.concurrent.locks.LockSupport;
 
 public final class Vr180Renderer implements android.opengl.GLSurfaceView.Renderer {
   public interface SurfaceCallback {
@@ -34,7 +36,6 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
   public static final int PROJECTION_FISHEYE_VR190 = 1;
   public static final int PROJECTION_FISHEYE_VR200 = 2;
   private static final String TAG = "Vr180Renderer";
-  private static final long MIN_RENDER_INTERVAL_MS = 16L;
   private static final String VERTEX_SHADER =
       "attribute vec2 aPosition;\n" +
           "varying vec2 vScreenUv;\n" +
@@ -133,8 +134,11 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
   private final int[] newestSurfaceInGroup = new int[VIDEO_GROUP_COUNT];
   private int surfaceWidth = 1;
   private int surfaceHeight = 1;
-  private long lastRenderRequestElapsedMs = 0L;
   private final long[] newestVideoTimestampNs = new long[VIDEO_GROUP_COUNT];
+  private long renderStatsStartNs;
+  private int renderStatsFrames;
+  private volatile float renderFramesPerSecond;
+  private long nextFrameTimeNs;
   private float zoom = 1.0f;
   private float centerYawRadians = 0.0f;
   private float horizonPitchRadians = 0.0f;
@@ -167,6 +171,8 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
     this.invalidator = invalidator;
   }
 
+  public float getRenderFramesPerSecond() { return renderFramesPerSecond; }
+
   public void setActiveSurfaceIndex(int surfaceIndex) {
     if (surfaceIndex < 0 || surfaceIndex >= VIDEO_SURFACE_COUNT) {
       AppLog.w(TAG, "Ignoring invalid active surface index " + surfaceIndex);
@@ -177,7 +183,7 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
     }
     activeSurfaceGroup = surfaceIndex / 2;
     activeSurfaceIndex = newestSurfaceInGroup[activeSurfaceGroup];
-    requestRender(false);
+    requestRender();
   }
 
   public void setHeadRotationMatrix(float[] matrix) {
@@ -187,7 +193,7 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
     synchronized (orientationLock) {
       System.arraycopy(matrix, 0, headRotationMatrix, 0, 9);
     }
-    requestRender(true);
+    requestRender();
   }
 
   public void setZoom(float zoom) {
@@ -196,7 +202,7 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
       AppLog.d(TAG, () -> "Zoom changed: " + this.zoom + " -> " + clampedZoom);
     }
     this.zoom = clampedZoom;
-    requestRender(false);
+    requestRender();
   }
 
   public void setViewOffsetDegrees(float centerYawDegrees, float horizonPitchDegrees) {
@@ -204,7 +210,7 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
         + ", horizonPitch=" + horizonPitchDegrees);
     centerYawRadians = (float) Math.toRadians(Math.max(-45.0f, Math.min(45.0f, centerYawDegrees)));
     horizonPitchRadians = (float) Math.toRadians(Math.max(-30.0f, Math.min(30.0f, horizonPitchDegrees)));
-    requestRender(false);
+    requestRender();
   }
 
   public void setProjectionMode(int projectionMode) {
@@ -219,7 +225,7 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
       AppLog.i(TAG, () -> "Projection mode changed: " + previousProjectionMode + " -> " + selectedProjectionMode);
     }
     this.projectionMode = nextProjectionMode;
-    requestRender(false);
+    requestRender();
   }
 
   public boolean isStereoOutput() {
@@ -229,6 +235,13 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
   @Override
   public void onSurfaceCreated(javax.microedition.khronos.opengles.GL10 gl, javax.microedition.khronos.egl.EGLConfig config) {
     AppLog.i(TAG, "GL surface created");
+    // Preserve queued buffers with synchronous swaps; absolute 90 Hz deadlines
+    // and presentation timestamps keep the phone from driving excess renders.
+    EGL14.eglSwapInterval(EGL14.eglGetCurrentDisplay(), 1);
+    nextFrameTimeNs = 0;
+    renderStatsStartNs = 0;
+    renderStatsFrames = 0;
+    renderFramesPerSecond = 0f;
     for (int i = 0; i < VIDEO_GROUP_COUNT; i++) {
       newestSurfaceInGroup[i] = i * 2;
       newestVideoTimestampNs[i] = Long.MIN_VALUE;
@@ -276,6 +289,20 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
 
   @Override
   public void onDrawFrame(javax.microedition.khronos.opengles.GL10 gl) {
+    // Absolute deadlines avoid accumulated sleep drift. Skip an expired deadline
+    // after a stall instead of producing a burst of stale head poses to catch up.
+    final long intervalNs = 1_000_000_000L / 90;
+    long frameTimeNs = System.nanoTime();
+    if (nextFrameTimeNs == 0 || frameTimeNs - nextFrameTimeNs > intervalNs) {
+      nextFrameTimeNs = frameTimeNs;
+    }
+    while (frameTimeNs < nextFrameTimeNs) {
+      LockSupport.parkNanos(nextFrameTimeNs - frameTimeNs);
+      frameTimeNs = System.nanoTime();
+    }
+    nextFrameTimeNs += intervalNs;
+    EGLExt.eglPresentationTimeANDROID(EGL14.eglGetCurrentDisplay(),
+        EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW), nextFrameTimeNs);
     GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
     if (program == 0) {
       return;
@@ -309,6 +336,15 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
     GLES20.glVertexAttribPointer(aPosition, 2, GLES20.GL_FLOAT, false, 0, vertexBuffer);
     GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
     GLES20.glDisableVertexAttribArray(aPosition);
+    long nowNs = System.nanoTime();
+    if (renderStatsStartNs == 0) renderStatsStartNs = nowNs;
+    renderStatsFrames++;
+    if (nowNs - renderStatsStartNs >= 2_000_000_000L) {
+      renderFramesPerSecond = renderStatsFrames * 1_000_000_000f / (nowNs - renderStatsStartNs);
+      AppLog.d(TAG, "VR render cadence: " + renderFramesPerSecond + " fps");
+      renderStatsFrames = 0;
+      renderStatsStartNs = nowNs;
+    }
   }
 
   public void release() {
@@ -348,7 +384,7 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
         frameAvailable[surfaceIndex] = true;
       }
     }
-    requestRender(false);
+    requestRender();
   }
 
   private void updateAvailableVideoFrames() {
@@ -381,14 +417,9 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
     }
   }
 
-  private void requestRender(boolean throttle) {
+  private void requestRender() {
     RenderInvalidator localInvalidator = invalidator;
     if (localInvalidator != null) {
-      long now = SystemClock.elapsedRealtime();
-      if (throttle && now - lastRenderRequestElapsedMs < MIN_RENDER_INTERVAL_MS) {
-        return;
-      }
-      lastRenderRequestElapsedMs = now;
       localInvalidator.requestRenderFrame();
     }
   }

@@ -29,6 +29,7 @@ class NrealDeviceThread extends Thread {
   private static final boolean DEBUG_OTHER_COMMANDS = false;
   private static final int IMU_COMMAND_TIMEOUT_MS = 500;
   private static final int MAX_FACTORY_CONFIG_BYTES = 128 * 1024;
+  private static final int DISPLAY_MODE_SBS_90_HZ = 9;
 
   // Constants from the datasheets, retained for the optional debug display.
   private static final float TICK_SCALE_S = 1f / 1E9f;
@@ -118,12 +119,12 @@ class NrealDeviceThread extends Thread {
       return;
     }
     AppLog.i(TAG, "Other HID stream started");
-    if (t_setDisplayModeStereo()) {
-      AppLog.i(TAG, "Requested Nreal Air SBS stereo display mode");
-      threadCallbacks.onMessage("Requested Nreal Air SBS stereo display mode");
+    if (t_setDisplayMode(DISPLAY_MODE_SBS_90_HZ)) {
+      AppLog.i(TAG, "Requested Nreal Air SBS 90 Hz display mode");
+      threadCallbacks.onMessage("Requested Nreal Air SBS 90 Hz display mode");
     } else {
-      AppLog.w(TAG, "Could not switch Nreal Air to SBS stereo display mode");
-      threadCallbacks.onMessage("Could not switch Nreal Air to SBS stereo display mode");
+      AppLog.w(TAG, "Could not switch Nreal Air to SBS 90 Hz display mode");
+      threadCallbacks.onMessage("Could not switch Nreal Air to SBS 90 Hz display mode");
     }
 
     lastUptimeNs = 0;
@@ -394,11 +395,11 @@ class NrealDeviceThread extends Thread {
     return true;
   }
 
-  private boolean t_setDisplayModeStereo() {
-    // Nreal Air MCU command 0x08 selects display mode. Mode 3 is full SBS,
-    // where the external display becomes 3840x1080 with one 1920x1080 half per eye.
-    AppLog.d(TAG, "Sending Nreal display mode stereo command");
-    return t_sendMcuCommand(0x08, new byte[]{0x03});
+  private boolean t_setDisplayMode(int displayMode) {
+    // Nreal/Xreal Air MCU command 0x08 selects the EDID/display timing profile.
+    // Stock Air firmware uses mode 3 for full-SBS 60 Hz and mode 9 for full-SBS 90 Hz.
+    AppLog.d(TAG, "Sending Nreal display mode command: mode=" + displayMode);
+    return t_sendMcuCommand(0x08, new byte[]{(byte) displayMode});
   }
 
   private boolean t_sendMcuCommand(int commandId, byte[] data) {

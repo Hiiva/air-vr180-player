@@ -2,8 +2,10 @@ package com.enricoros.nreal.player;
 
 import android.content.Context;
 import android.opengl.GLSurfaceView;
+import android.os.Build;
 import android.util.AttributeSet;
 import android.view.Surface;
+import android.view.SurfaceHolder;
 
 import com.enricoros.nreal.AppLog;
 
@@ -70,6 +72,8 @@ public final class VrVideoSurfaceView extends GLSurfaceView implements Vr180Rend
     return renderer.isStereoOutput();
   }
 
+  public float getRenderFramesPerSecond() { return renderer.getRenderFramesPerSecond(); }
+
   public void releaseRenderer() {
     if (released) {
       AppLog.d(TAG, "releaseRenderer ignored: already released");
@@ -82,7 +86,27 @@ public final class VrVideoSurfaceView extends GLSurfaceView implements Vr180Rend
 
   @Override
   public void requestRenderFrame() {
-    requestRender();
+    if (!released) requestRender();
+  }
+
+  @Override
+  public void surfaceCreated(SurfaceHolder holder) {
+    super.surfaceCreated(holder);
+    requestOutputFrameRate();
+  }
+
+  public void requestOutputFrameRate() {
+    Surface surface = getHolder().getSurface();
+    if (!released && surface != null && surface.isValid()) {
+      // Head-tracked rendering can adapt to the compositor's cadence; this is not
+      // the fixed frame rate of the underlying movie.
+      if (Build.VERSION.SDK_INT >= 31) {
+        surface.setFrameRate(90f, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT,
+            Surface.CHANGE_FRAME_RATE_ALWAYS);
+      } else {
+        surface.setFrameRate(90f, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);
+      }
+    }
   }
 
   private Vr180Renderer createRenderer(Vr180Renderer.SurfaceCallback surfaceCallback) {
@@ -91,7 +115,9 @@ public final class VrVideoSurfaceView extends GLSurfaceView implements Vr180Rend
     Vr180Renderer renderer = new Vr180Renderer(surfaceCallback);
     renderer.setRenderInvalidator(this);
     setRenderer(renderer);
-    setRenderMode(GLSurfaceView.RENDERMODE_WHEN_DIRTY);
+    // The renderer owns its deadlines and supplies EGL presentation timestamps.
+    // Do not add a separate timer that can queue render requests while swaps are blocked.
+    setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
     return renderer;
   }
 }

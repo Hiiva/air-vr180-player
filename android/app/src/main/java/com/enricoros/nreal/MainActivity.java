@@ -146,7 +146,6 @@ public class MainActivity extends AppCompatActivity {
   private static final long SKIP_MS = 10_000L;
   private static final long PROGRESS_UPDATE_MS = 500L;
   private static final long LOOP_UPDATE_MS = 16L;
-  private static final long MIN_TRACKING_RENDER_INTERVAL_MS = 16L;
   private static final long VERBOSE_STATS_INTERVAL_MS = 5000L;
   private static final int SERVER_THUMBNAIL_PREFETCH_COUNT = 24;
   private static final int PLAYER_MIN_BUFFER_MS = 15_000;
@@ -241,7 +240,6 @@ public class MainActivity extends AppCompatActivity {
   private boolean loopPaused = false;
   private long lastImuElapsedMs = 0L;
   private long lastStatusElapsedMs = 0L;
-  private long lastTrackingRenderElapsedMs = 0L;
   private long lastTrackingLogElapsedMs = 0L;
   private long lastVideoFrameLogElapsedMs = 0L;
   private int loopBoundaryGeneration = 0;
@@ -598,6 +596,7 @@ public class MainActivity extends AppCompatActivity {
     progressUpdatesScheduled = false;
     loopUpdatesScheduled = false;
     clearLoopBoundaryMessage();
+    setPhonePacesetterHighRefresh(false);
     updateKeepScreenOn();
   }
 
@@ -610,6 +609,7 @@ public class MainActivity extends AppCompatActivity {
     uiHandler.removeCallbacks(loopUpdater);
     saveCurrentVideoProgress();
     watchTimeTrackingActive = false;
+    setPhonePacesetterHighRefresh(false);
     dismissPresentation();
     clearLoopBoundaryMessage();
     if (player != null) {
@@ -1015,6 +1015,7 @@ public class MainActivity extends AppCompatActivity {
     currentVideoFromServer = false;
     currentServerVideo = null;
     resetLoop();
+    setPhonePacesetterHighRefresh(false);
     dismissPresentation();
     if (nrealManager != null) {
       nrealManager.closeNrealUsbDevice();
@@ -2206,17 +2207,21 @@ public class MainActivity extends AppCompatActivity {
 
   private void updatePresentation() {
     if (windowsRemoteEnabled) {
+      setPhonePacesetterHighRefresh(false);
       dismissPresentation();
       return;
     }
     Display display = findBestExternalDisplay();
     if (display == null) {
       AppLog.i(TAG, "No external presentation display found");
+      setPhonePacesetterHighRefresh(false);
       dismissPresentation();
       updateStatus();
       return;
     }
+    setPhonePacesetterHighRefresh(true);
     if (presentation != null && presentation.getDisplay().getDisplayId() == display.getDisplayId()) {
+      presentation.refreshOutputMode();
       AppLog.d(TAG, () -> "Keeping existing presentation display: " + displaySummary(display));
       updateStatus();
       return;
@@ -2229,6 +2234,7 @@ public class MainActivity extends AppCompatActivity {
       if (presentation == dialog) {
         AppLog.i(TAG, "VR presentation dismissed");
         presentation = null;
+        setPhonePacesetterHighRefresh(false);
         updateStatus();
       }
     });
@@ -2255,6 +2261,7 @@ public class MainActivity extends AppCompatActivity {
 
   private void handlePresentationFailure(String message, RuntimeException error) {
     AppLog.e(TAG, "Could not create external VR presentation", error);
+    setPhonePacesetterHighRefresh(false);
     VrPlayerPresentation failedPresentation = presentation;
     presentation = null;
     if (failedPresentation != null) {
@@ -2269,6 +2276,66 @@ public class MainActivity extends AppCompatActivity {
     }
     lastDeviceMessage = message;
     updateStatus();
+  }
+
+  @SuppressWarnings("deprecation")
+  private void setPhonePacesetterHighRefresh(boolean enabled) {
+    enabled = enabled && activityStarted;
+    Window window = getWindow();
+    if (window == null) {
+      return;
+    }
+    WindowManager.LayoutParams params = window.getAttributes();
+    if (!enabled) {
+      boolean minimumChanged = com.enricoros.nreal.player.WindowRefreshRate.setMinimum(params, 0f);
+      if (Build.VERSION.SDK_INT >= 35) {
+        window.getDecorView().setRequestedFrameRate(0.0f);
+      }
+      if (minimumChanged || params.preferredDisplayModeId != 0 || params.preferredRefreshRate != 0.0f) {
+        params.preferredDisplayModeId = 0;
+        params.preferredRefreshRate = 0.0f;
+        window.setAttributes(params);
+        AppLog.i(TAG, "Released phone high-refresh pacesetter request");
+      }
+      return;
+    }
+
+    Display phoneDisplay = displayManager == null
+        ? null
+        : displayManager.getDisplay(Display.DEFAULT_DISPLAY);
+    if (phoneDisplay == null) {
+      return;
+    }
+    Display.Mode currentMode = phoneDisplay.getMode();
+    Display.Mode bestMode = null;
+    for (Display.Mode mode : phoneDisplay.getSupportedModes()) {
+      if (mode.getPhysicalWidth() != currentMode.getPhysicalWidth()
+          || mode.getPhysicalHeight() != currentMode.getPhysicalHeight()) {
+        continue;
+      }
+      // Use the lowest available phone rate that can pace the 90 Hz external display.
+      if (mode.getRefreshRate() >= 89f
+          && (bestMode == null || mode.getRefreshRate() < bestMode.getRefreshRate())) {
+        bestMode = mode;
+      }
+    }
+    if (bestMode == null) {
+      AppLog.w(TAG, "No phone display mode available to pace 90 Hz output");
+      return;
+    }
+    // Window refresh policies use nominal rates; mode timings can report values such
+    // as 120.00001, which some policies reject as exceeding their 120 Hz limit.
+    float refreshRate = Math.round(bestMode.getRefreshRate());
+    boolean minimumChanged = com.enricoros.nreal.player.WindowRefreshRate.setMinimum(params, refreshRate);
+    if (minimumChanged || params.preferredDisplayModeId != 0 || params.preferredRefreshRate != refreshRate) {
+      params.preferredDisplayModeId = 0;
+      params.preferredRefreshRate = refreshRate;
+      window.setAttributes(params);
+      AppLog.i(TAG, "Requesting phone refresh rate " + refreshRate + " Hz for external rendering");
+    }
+    if (Build.VERSION.SDK_INT >= 35) {
+      window.getDecorView().setRequestedFrameRate(refreshRate);
+    }
   }
 
   private void dismissPresentation() {
@@ -2413,8 +2480,7 @@ public class MainActivity extends AppCompatActivity {
               gyro[2]));
         }
       }
-      if (presentation != null && now - lastTrackingRenderElapsedMs >= MIN_TRACKING_RENDER_INTERVAL_MS) {
-        lastTrackingRenderElapsedMs = now;
+      if (presentation != null) {
         presentation.setHeadRotationMatrix(headTracker.getRotationMatrix());
       }
       if (now - lastStatusElapsedMs > 500L) {
@@ -2660,7 +2726,9 @@ public class MainActivity extends AppCompatActivity {
         mode.getPhysicalWidth(),
         mode.getPhysicalHeight(),
         mode.getRefreshRate());
-    return "Output: " + modeText + (presentation.isStereoOutput() ? ", SBS stereo" : ", 2D mirror mode");
+    float renderFps = presentation.getRenderFramesPerSecond();
+    return "Output: " + modeText + (presentation.isStereoOutput() ? ", SBS stereo" : ", 2D mirror mode")
+        + (renderFps > 0f ? String.format(Locale.US, ", rendering %.0f fps", renderFps) : "");
   }
 
   private String buildTrackingStatus() {
