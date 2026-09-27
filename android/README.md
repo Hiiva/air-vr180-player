@@ -20,6 +20,7 @@ display-mode control and IMU head tracking.
 - Playback speed from 0.80x to 1.20x, saved per video
 - Saved positions and saved A/B scenes
 - Optional server library browsing and HTTP streaming
+- Streamed-video quality comparison with manual version toggles and timestamp alignment
 - Windows Remote mode for controlling the Windows player from the same Android UI
 
 The glasses currently targeted by the USB driver use vendor/product ID

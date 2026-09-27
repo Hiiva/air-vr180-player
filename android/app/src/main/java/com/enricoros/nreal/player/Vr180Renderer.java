@@ -27,7 +27,8 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
     void requestRenderFrame();
   }
 
-  public static final int VIDEO_SURFACE_COUNT = 3;
+  public static final int VIDEO_GROUP_COUNT = 3;
+  public static final int VIDEO_SURFACE_COUNT = VIDEO_GROUP_COUNT * 2;
   private static final float BASE_HORIZONTAL_FOV_DEGREES = 40.605104f;
   public static final int PROJECTION_EQUIRECT_VR180 = 0;
   public static final int PROJECTION_FISHEYE_VR190 = 1;
@@ -128,10 +129,12 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
   private int uStereoOutput = -1;
   private int uProjectionMode = -1;
   private int activeSurfaceIndex = 0;
+  private int activeSurfaceGroup = 0;
+  private final int[] newestSurfaceInGroup = new int[VIDEO_GROUP_COUNT];
   private int surfaceWidth = 1;
   private int surfaceHeight = 1;
   private long lastRenderRequestElapsedMs = 0L;
-  private long newestVideoTimestampNs = Long.MIN_VALUE;
+  private final long[] newestVideoTimestampNs = new long[VIDEO_GROUP_COUNT];
   private float zoom = 1.0f;
   private float centerYawRadians = 0.0f;
   private float horizonPitchRadians = 0.0f;
@@ -153,6 +156,10 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
     for (int i = 0; i < VIDEO_SURFACE_COUNT; i++) {
       setIdentity(videoTransforms[i]);
     }
+    for (int i = 0; i < VIDEO_GROUP_COUNT; i++) {
+      newestSurfaceInGroup[i] = i * 2;
+      newestVideoTimestampNs[i] = Long.MIN_VALUE;
+    }
   }
 
   public void setRenderInvalidator(RenderInvalidator invalidator) {
@@ -168,7 +175,8 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
     if (activeSurfaceIndex != surfaceIndex) {
       AppLog.i(TAG, () -> "Active surface changed: " + activeSurfaceIndex + " -> " + surfaceIndex);
     }
-    activeSurfaceIndex = surfaceIndex;
+    activeSurfaceGroup = surfaceIndex / 2;
+    activeSurfaceIndex = newestSurfaceInGroup[activeSurfaceGroup];
     requestRender(false);
   }
 
@@ -221,7 +229,10 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
   @Override
   public void onSurfaceCreated(javax.microedition.khronos.opengles.GL10 gl, javax.microedition.khronos.egl.EGLConfig config) {
     AppLog.i(TAG, "GL surface created");
-    newestVideoTimestampNs = Long.MIN_VALUE;
+    for (int i = 0; i < VIDEO_GROUP_COUNT; i++) {
+      newestSurfaceInGroup[i] = i * 2;
+      newestVideoTimestampNs[i] = Long.MIN_VALUE;
+    }
     GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     program = buildProgram(VERTEX_SHADER, FRAGMENT_SHADER);
     aPosition = GLES20.glGetAttribLocation(program, "aPosition");
@@ -359,9 +370,11 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
       // surface timestamps. A delayed callback from the other decoder must not replace
       // a newer frame acquired in a previous draw.
       long timestampNs = surfaceTexture.getTimestamp();
-      if (timestampNs >= newestVideoTimestampNs) {
-        newestVideoTimestampNs = timestampNs;
-        activeSurfaceIndex = i;
+      int group = i / 2;
+      if (timestampNs >= newestVideoTimestampNs[group]) {
+        newestVideoTimestampNs[group] = timestampNs;
+        newestSurfaceInGroup[group] = i;
+        if (group == activeSurfaceGroup) activeSurfaceIndex = i;
       }
       final int surfaceIndex = i;
       mainHandler.post(() -> surfaceCallback.onVideoFrameAvailable(surfaceIndex));

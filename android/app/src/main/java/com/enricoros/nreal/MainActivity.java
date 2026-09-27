@@ -51,7 +51,6 @@ import androidx.media3.datasource.DataSource;
 import androidx.media3.datasource.DefaultDataSource;
 import androidx.media3.datasource.DefaultHttpDataSource;
 import androidx.media3.exoplayer.DefaultLoadControl;
-import androidx.media3.exoplayer.DefaultRenderersFactory;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.exoplayer.PlayerMessage;
 import androidx.media3.exoplayer.SeekParameters;
@@ -171,7 +170,7 @@ public class MainActivity extends AppCompatActivity {
       Vr180Renderer.PROJECTION_FISHEYE_VR190,
       Vr180Renderer.PROJECTION_FISHEYE_VR200
   };
-  private static final int ACTIVE_VIDEO_SURFACE_INDEX = 0;
+  private int activeVideoSurfaceIndex = 0;
   private static final boolean LOG_VERBOSE_STATS = AppLog.isVerboseEnabled(TAG);
 
   private final Handler uiHandler = new Handler(Looper.getMainLooper());
@@ -195,8 +194,11 @@ public class MainActivity extends AppCompatActivity {
   private NrealManager nrealManager;
   private ActivityMainBinding binding;
   private ExoPlayer player;
-  private final HevcPlaybackRenderersFactory.Surfaces playbackSurfaces =
-      new HevcPlaybackRenderersFactory.Surfaces();
+  private final HevcPlaybackRenderersFactory.Surfaces[] playbackSurfaces = {
+      new HevcPlaybackRenderersFactory.Surfaces(),
+      new HevcPlaybackRenderersFactory.Surfaces(),
+      new HevcPlaybackRenderersFactory.Surfaces()
+  };
   private boolean playerUsesConstrainedBuffers = false;
   private String playerServerApiKey = "";
   private volatile int thumbnailLoadGeneration = 0;
@@ -209,6 +211,8 @@ public class MainActivity extends AppCompatActivity {
   private VrPlayerPresentation presentation;
   private RecentVideo currentVideo;
   private SavedScenesController savedScenes;
+  private VideoComparisonController comparison;
+  private volatile long lastVideoFrameTimeUs = C.TIME_UNSET;
   private boolean currentVideoFromServer = false;
   private ServerVideo currentServerVideo;
   private Dialog serverDialog;
@@ -382,6 +386,7 @@ public class MainActivity extends AppCompatActivity {
           + ", pixelRatio=" + videoSize.pixelWidthHeightRatio);
       updatePlaybackUi();
     }
+
   };
 
   private final DisplayManager.DisplayListener displayListener = new DisplayManager.DisplayListener() {
@@ -413,12 +418,14 @@ public class MainActivity extends AppCompatActivity {
       }
       AppLog.i(TAG, "Video surface created: index=" + surfaceIndex);
       videoSurfaces[surfaceIndex] = surface;
-      playbackSurfaces.set(surfaceIndex, surface);
-      if (videoSurfaces[0] != null && videoSurfaces[1] != null) {
-        attachSlotSurface(player, ACTIVE_VIDEO_SURFACE_INDEX);
+      playbackSurfaces[surfaceIndex / 2].set(surfaceIndex % 2, surface);
+      if (comparingVideos()) {
+        comparison.surfacesChanged();
+      } else if (videoSurfaces[activeVideoSurfaceIndex] != null && videoSurfaces[activeVideoSurfaceIndex + 1] != null) {
+        attachSlotSurface(player, activeVideoSurfaceIndex);
       }
       if (presentation != null) {
-        presentation.setActiveVideoSurfaceIndex(ACTIVE_VIDEO_SURFACE_INDEX);
+        presentation.setActiveVideoSurfaceIndex(activeVideoSurfaceIndex);
       }
       updateStatus();
       updateKeepScreenOn();
@@ -431,18 +438,20 @@ public class MainActivity extends AppCompatActivity {
         return;
       }
       AppLog.i(TAG, "Video surface destroyed: index=" + surfaceIndex);
-      if (surfaceIndex == ACTIVE_VIDEO_SURFACE_INDEX && player != null) {
+      if (surfaceIndex == activeVideoSurfaceIndex && player != null) {
         player.clearVideoSurface(surface);
       }
+      if (comparingVideos()) comparison.surfaceLost(surfaceIndex);
       videoSurfaceAttachedSurfaces[surfaceIndex] = null;
       videoSurfaces[surfaceIndex] = null;
-      playbackSurfaces.set(surfaceIndex, null);
+      playbackSurfaces[surfaceIndex / 2].set(surfaceIndex % 2, null);
       updateStatus();
       updateKeepScreenOn();
     }
 
     @Override
     public void onVideoFrameAvailable(int surfaceIndex) {
+      if (comparingVideos()) comparison.surfaceFrameAvailable(surfaceIndex);
       if (!isValidSurfaceIndex(surfaceIndex)) {
         AppLog.w(TAG, "Video frame received for invalid surface index " + surfaceIndex);
         return;
@@ -482,7 +491,7 @@ public class MainActivity extends AppCompatActivity {
     displayManager = (DisplayManager) getSystemService(DISPLAY_SERVICE);
     player = createPlayer();
     playerServerApiKey = getServerApiKey();
-    attachSlotSurface(player, ACTIVE_VIDEO_SURFACE_INDEX);
+    attachSlotSurface(player, activeVideoSurfaceIndex);
     applyAudioMuted();
     nrealManager = new NrealManager(getApplicationContext(), nrealListener);
     recentVideos.addAll(RecentVideoStore.load(this));
@@ -502,6 +511,51 @@ public class MainActivity extends AppCompatActivity {
         restoreSavedScene(target, scene, success, failure);
       }
     });
+    comparison = new VideoComparisonController(this, binding.compareVideosButton, binding.comparisonPanel,
+        new VideoComparisonController.Host() {
+          @Override public ExoPlayer player() { return player; }
+          @Override public ServerVideo current() { return currentServerVideo; }
+          @Override public boolean available() {
+            return !windowsRemoteEnabled && currentVideoFromServer && currentServerVideo != null && currentVideo != null;
+          }
+          @Override public void begin() { saveCurrentVideoProgress(); }
+          @Override public void pick() { openServerLibraryDialog(); }
+          @Override public int slot() { return activeVideoSurfaceIndex; }
+          @Override public long frameTimeUs() { return lastVideoFrameTimeUs; }
+          @Override public ExoPlayer create(int slot) { return createPlayer(true, slot); }
+          @Override public boolean attach(ExoPlayer target, int slot) {
+            if (videoSurfaces[slot] == null || videoSurfaces[slot + 1] == null) return false;
+            attachSlotSurface(target, slot);
+            return true;
+          }
+          @Override public void release(ExoPlayer target, int slot) {
+            clearSlotSurface(target, slot);
+            target.release();
+          }
+          @Override public void select(ServerVideo video, ExoPlayer target, int slot) {
+            selectComparisonVideo(video, target, slot);
+          }
+          @Override public float volume() { return audioMuted ? 0f : 1f; }
+          @Override public void changed() { updatePlaybackUi(); }
+
+          @Override public long loopStart() { return loopStartMs; }
+          @Override public long loopEnd() { return loopEndMs; }
+          @Override public boolean loopPaused() { return loopPaused; }
+          @Override public void loop(long start, long end, boolean paused) {
+            clearLoopBoundaryMessage();
+            loopStartMs = start;
+            loopEndMs = end;
+            loopPaused = paused;
+            scheduleLoopBoundaryMessage();
+            scheduleLoopUpdates();
+            updateLoopControls();
+          }
+          @Override public void finish() {
+            resetLoop();
+            configurePlayer();
+            updatePlaybackUi();
+          }
+        });
     configurePlayer();
     configureControls();
     renderRecentVideos();
@@ -550,6 +604,7 @@ public class MainActivity extends AppCompatActivity {
   @Override
   protected void onDestroy() {
     AppLog.i(TAG, "onDestroy");
+    if (comparison != null) comparison.close();
     if (savedScenes != null) savedScenes.close();
     uiHandler.removeCallbacks(progressUpdater);
     uiHandler.removeCallbacks(loopUpdater);
@@ -595,6 +650,9 @@ public class MainActivity extends AppCompatActivity {
     AppLog.d(TAG, "Configuring player listener");
     player.removeListener(activePlayerListener);
     player.addListener(activePlayerListener);
+    if (!comparingVideos()) {
+      player.setVideoFrameMetadataListener((pts, release, format, mediaFormat) -> lastVideoFrameTimeUs = pts);
+    }
   }
 
   private void configureControls() {
@@ -640,6 +698,11 @@ public class MainActivity extends AppCompatActivity {
     binding.playPauseButton.setOnClickListener(v -> {
       if (windowsRemoteEnabled) {
         sendWindowsRemoteCommand(commandJson("playPause"));
+        return;
+      }
+      if (comparingVideos()) {
+        comparison.setPlaying(!comparison.playing());
+        updatePlaybackUi();
         return;
       }
       if (currentVideo == null) {
@@ -926,6 +989,7 @@ public class MainActivity extends AppCompatActivity {
   }
 
   private void enterWindowsRemoteMode() {
+    if (comparison != null) comparison.end();
     AppLog.i(TAG, "Entering Windows remote mode");
     saveCurrentVideoProgress();
 
@@ -1291,6 +1355,10 @@ public class MainActivity extends AppCompatActivity {
   }
 
   private ExoPlayer createPlayer(boolean constrainedBuffers) {
+    return createPlayer(constrainedBuffers, activeVideoSurfaceIndex);
+  }
+
+  private ExoPlayer createPlayer(boolean constrainedBuffers, int slot) {
     int minBufferMs = constrainedBuffers ? PLAYER_CONSTRAINED_MIN_BUFFER_MS : PLAYER_MIN_BUFFER_MS;
     int maxBufferMs = constrainedBuffers ? PLAYER_CONSTRAINED_MAX_BUFFER_MS : PLAYER_MAX_BUFFER_MS;
     int backBufferMs = constrainedBuffers ? PLAYER_CONSTRAINED_BACK_BUFFER_MS : PLAYER_BACK_BUFFER_MS;
@@ -1310,7 +1378,7 @@ public class MainActivity extends AppCompatActivity {
       loadControlBuilder.setTargetBufferBytes(PLAYER_CONSTRAINED_TARGET_BUFFER_BYTES);
     }
     DefaultLoadControl loadControl = loadControlBuilder.build();
-    return new ExoPlayer.Builder(this, createRenderersFactory())
+    return new ExoPlayer.Builder(this, new HevcPlaybackRenderersFactory(this, playbackSurfaces[slot / 2]))
         .setLoadControl(loadControl)
         .setPriority(C.PRIORITY_PLAYBACK)
         .setPriorityTaskManager(playbackPriorityTaskManager)
@@ -1320,11 +1388,6 @@ public class MainActivity extends AppCompatActivity {
         .build();
   }
 
-
-  private DefaultRenderersFactory createRenderersFactory() {
-    AppLog.d(TAG, "Creating HEVC renderers factory with async codec queueing");
-    return new HevcPlaybackRenderersFactory(this, playbackSurfaces);
-  }
 
   private DataSource.Factory createDataSourceFactory() {
     AppLog.d(TAG, "Creating data source factory");
@@ -1341,6 +1404,7 @@ public class MainActivity extends AppCompatActivity {
   }
 
   private void playLocalVideo(RecentVideo video) {
+    if (comparison != null) comparison.end();
     AppLog.i(TAG, () -> "Local playback requested: " + video.title);
     saveCurrentVideoProgress();
     currentVideo = null;
@@ -1368,6 +1432,7 @@ public class MainActivity extends AppCompatActivity {
     resetLoop();
     binding.currentVideoTitle.setText(video.title);
     preparePlayerForVideoPlayback(video);
+    lastVideoFrameTimeUs = C.TIME_UNSET;
     player.setMediaItem(MediaItem.fromUri(video.uri), Math.max(0L, video.lastPositionMs));
     player.prepare();
     player.setPlaybackSpeed(playbackSpeed);
@@ -1387,6 +1452,12 @@ public class MainActivity extends AppCompatActivity {
   }
 
   private void playServerVideo(ServerVideo serverVideo) {
+    if (comparison != null && comparison.picking()) {
+      comparison.add(serverVideo);
+      closeServerDialog();
+      return;
+    }
+    if (comparison != null) comparison.end();
     AppLog.i(TAG, () -> "Server playback requested: id=" + serverVideo.id
         + ", title=" + serverVideo.displayTitle()
         + ", uri=" + serverVideo.uri
@@ -1420,26 +1491,48 @@ public class MainActivity extends AppCompatActivity {
     renderServerDialogRows();
   }
 
+  private boolean comparingVideos() {
+    return comparison != null && comparison.active();
+  }
+
+  private void selectComparisonVideo(ServerVideo source, ExoPlayer target, int slot) {
+    // Both decoders stay attached and running. A toggle only selects the warm texture group.
+    updateWatchTimeTracking();
+    clearLoopBoundaryMessage();
+    player.removeListener(activePlayerListener);
+    player = target;
+    activeVideoSurfaceIndex = slot;
+    playerUsesConstrainedBuffers = true;
+    currentServerVideo = source.copy();
+    currentVideoFromServer = true;
+    currentVideo = new RecentVideo(source.uri, source.displayTitle(), source.size,
+        player.getCurrentPosition(), source.watchedTimeMs, source.durationMs, projectionMode);
+    playbackMessage = "";
+    configurePlayer();
+    if (presentation != null) presentation.setActiveVideoSurfaceIndex(slot);
+    resetWatchTimeTracking();
+  }
+
   private void preparePlayerForVideoPlayback(RecentVideo video) {
     releaseThumbnailMemoryForPlayback();
     boolean constrainedBuffers = shouldConstrainPlayerBuffers(video);
     String serverApiKey = getServerApiKey();
     if (player != null && playerUsesConstrainedBuffers == constrainedBuffers && playerServerApiKey.equals(serverApiKey)) {
       AppLog.d(TAG, () -> "Keeping current player buffer profile: constrained=" + playerUsesConstrainedBuffers);
-      attachSlotSurface(player, ACTIVE_VIDEO_SURFACE_INDEX);
+      attachSlotSurface(player, activeVideoSurfaceIndex);
       return;
     }
     ExoPlayer oldPlayer = player;
     if (oldPlayer != null) {
       AppLog.i(TAG, () -> "Recreating player for buffer profile: constrained=" + constrainedBuffers);
       oldPlayer.removeListener(activePlayerListener);
-      clearSlotSurface(oldPlayer, ACTIVE_VIDEO_SURFACE_INDEX);
+      clearSlotSurface(oldPlayer, activeVideoSurfaceIndex);
       oldPlayer.release();
     }
     player = createPlayer(constrainedBuffers);
     playerUsesConstrainedBuffers = constrainedBuffers;
     playerServerApiKey = serverApiKey;
-    attachSlotSurface(player, ACTIVE_VIDEO_SURFACE_INDEX);
+    attachSlotSurface(player, activeVideoSurfaceIndex);
     applyAudioMuted();
     configurePlayer();
   }
@@ -1738,8 +1831,8 @@ public class MainActivity extends AppCompatActivity {
         + ", loopReady=" + isLoopReady()
         + ", current=" + currentVideoTitleForLog());
     updateWatchTimeTracking();
-    player.setSeekParameters(SeekParameters.CLOSEST_SYNC);
-    player.seekTo(positionMs);
+    player.setSeekParameters(comparingVideos() ? SeekParameters.EXACT : SeekParameters.CLOSEST_SYNC);
+    if (comparingVideos()) comparison.seekTo(positionMs); else player.seekTo(positionMs);
     resetWatchTimeTrackingAnchor();
     if (isLoopActive()) {
       clearLoopBoundaryMessage();
@@ -1766,7 +1859,7 @@ public class MainActivity extends AppCompatActivity {
     clearLoopBoundaryMessage();
     // A nearby keyframe before A would immediately trigger another restart, even while paused.
     player.setSeekParameters(SeekParameters.EXACT);
-    player.seekTo(loopStartMs);
+    if (comparingVideos()) comparison.seekTo(loopStartMs); else player.seekTo(loopStartMs);
     resetWatchTimeTrackingAnchor();
     final int generation = loopBoundaryGeneration;
     uiHandler.post(() -> {
@@ -1786,6 +1879,7 @@ public class MainActivity extends AppCompatActivity {
   }
 
   private void scheduleLoopBoundaryMessage() {
+    if (comparingVideos() && comparison.preparing()) return;
     if (loopRestartPending || !isLoopActive() || player == null || player.getCurrentMediaItem() == null) {
       AppLog.v(TAG, () -> "Loop boundary message not scheduled: pending=" + loopRestartPending
           + ", loopActive=" + isLoopActive()
@@ -1866,6 +1960,7 @@ public class MainActivity extends AppCompatActivity {
   }
 
   private SavedSceneStore.Target currentSceneTarget() {
+    if (comparingVideos()) return null;
     if (windowsRemoteEnabled) {
       if (windowsRemoteState == null || !windowsRemoteState.hasMedia()
           || windowsRemoteState.currentServerId.isEmpty()) return null;
@@ -1988,7 +2083,7 @@ public class MainActivity extends AppCompatActivity {
       scheduleLoopBoundaryMessage();
       enforceLoopBoundary();
       if (player != null) {
-        player.play();
+        if (comparingVideos()) comparison.setPlaying(true); else player.play();
       }
       scheduleLoopUpdates();
     } else {
@@ -2072,6 +2167,7 @@ public class MainActivity extends AppCompatActivity {
   }
 
   private void persistCurrentServerLoopPoints() {
+    if (comparingVideos()) return;
     if (!currentVideoFromServer || currentVideo == null || currentServerVideo == null) {
       return;
     }
@@ -2145,7 +2241,7 @@ public class MainActivity extends AppCompatActivity {
       handlePresentationFailure("External display failed: " + e.getClass().getSimpleName(), e);
       return;
     }
-    presentation.setActiveVideoSurfaceIndex(ACTIVE_VIDEO_SURFACE_INDEX);
+    presentation.setActiveVideoSurfaceIndex(activeVideoSurfaceIndex);
     presentation.setZoom(viewScale);
     presentation.setProjectionMode(projectionMode);
     presentation.setViewOffsetDegrees(sceneCenterDegrees, horizonDegrees);
@@ -2186,12 +2282,13 @@ public class MainActivity extends AppCompatActivity {
     oldPresentation.releaseRenderer();
     oldPresentation.dismiss();
     for (int i = 0; i < videoSurfaces.length; i++) {
-      if (i == ACTIVE_VIDEO_SURFACE_INDEX) {
+      if (comparingVideos()) comparison.surfaceLost(i);
+      if (i == activeVideoSurfaceIndex) {
         clearSlotSurface(player, i);
       }
       videoSurfaceAttachedSurfaces[i] = null;
       videoSurfaces[i] = null;
-      playbackSurfaces.set(i, null);
+      playbackSurfaces[i / 2].set(i % 2, null);
     }
     updateKeepScreenOn();
   }
@@ -2334,6 +2431,7 @@ public class MainActivity extends AppCompatActivity {
   };
 
   private void updatePlaybackUi() {
+    if (comparison != null) comparison.update();
     if (savedScenes != null) savedScenes.update();
     if (windowsRemoteEnabled) {
       applyWindowsRemoteUi();
@@ -2352,12 +2450,15 @@ public class MainActivity extends AppCompatActivity {
     // Local mode must always take ownership back explicitly; with no video the same button
     // intentionally opens the local picker.
     binding.playPauseButton.setEnabled(player != null);
-    boolean isPlaybackRequested = player != null && player.getPlayWhenReady();
+    boolean isPlaybackRequested = comparingVideos() ? comparison.playing() : player != null && player.getPlayWhenReady();
     binding.playPauseButton.setText(isPlaybackRequested ? "Pause" : "Play");
     binding.playPauseButton.setIconResource(isPlaybackRequested
         ? R.drawable.ic_pause_24
         : R.drawable.ic_play_arrow_24);
     binding.currentVideoTitle.setText(hasVideo ? currentVideo.title : "No video selected");
+    binding.currentVideoTitle.setMinLines(comparingVideos() ? 3 : 1);
+    binding.currentVideoTitle.setMaxLines(comparingVideos() ? 3 : Integer.MAX_VALUE);
+    binding.currentVideoTitle.setEllipsize(comparingVideos() ? android.text.TextUtils.TruncateAt.END : null);
     updateLoopControls();
     updateStatus();
     scheduleProgressUpdates();
@@ -2365,6 +2466,7 @@ public class MainActivity extends AppCompatActivity {
   }
 
   private void updatePlaybackProgress() {
+    if (comparison != null) comparison.update();
     if (savedScenes != null) savedScenes.update();
     if (windowsRemoteEnabled) {
       applyWindowsRemoteProgress();
@@ -2396,6 +2498,7 @@ public class MainActivity extends AppCompatActivity {
   }
 
   private void enforceLoopBoundary(long positionMs) {
+    if (comparingVideos() && comparison.preparing()) return;
     if (!loopRestartPending && isLoopActive()
         && (positionMs < loopStartMs || positionMs >= loopEndMs)) {
       seekToLoopStart();
@@ -2440,15 +2543,15 @@ public class MainActivity extends AppCompatActivity {
         return;
       }
       keepAwake = player.isPlaying()
-          && (presentation == null || videoSurfaces[ACTIVE_VIDEO_SURFACE_INDEX] == null);
+          && (presentation == null || videoSurfaces[activeVideoSurfaceIndex] == null);
     }
     if (keepAwake) {
       AppLog.d(TAG, () -> "Keep screen on: enabled, presentationPresent=" + (presentation != null)
-          + ", activeSurfacePresent=" + (videoSurfaces[ACTIVE_VIDEO_SURFACE_INDEX] != null));
+          + ", activeSurfacePresent=" + (videoSurfaces[activeVideoSurfaceIndex] != null));
       getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     } else {
       AppLog.d(TAG, () -> "Keep screen on: disabled, presentationPresent=" + (presentation != null)
-          + ", activeSurfacePresent=" + (videoSurfaces[ACTIVE_VIDEO_SURFACE_INDEX] != null));
+          + ", activeSurfacePresent=" + (videoSurfaces[activeVideoSurfaceIndex] != null));
       getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     }
   }
@@ -2456,7 +2559,7 @@ public class MainActivity extends AppCompatActivity {
   private void applyAudioMuted() {
     if (player != null) {
       AppLog.d(TAG, "Applying audio volume: muted=" + audioMuted);
-      player.setVolume(audioMuted ? 0.0f : 1.0f);
+      if (comparingVideos()) comparison.applyVolume(); else player.setVolume(audioMuted ? 0.0f : 1.0f);
     }
   }
 
@@ -2735,7 +2838,7 @@ public class MainActivity extends AppCompatActivity {
     root.setBackgroundColor(getColor(R.color.panel));
 
     TextView title = new TextView(this);
-    title.setText("Server videos");
+    title.setText(comparison != null && comparison.picking() ? "Choose comparison version" : "Server videos");
     title.setTextColor(getColor(R.color.ink));
     title.setTextSize(20);
     title.setTextAlignment(View.TEXT_ALIGNMENT_CENTER);
@@ -2916,6 +3019,7 @@ public class MainActivity extends AppCompatActivity {
 
     dialog.setContentView(root);
     dialog.setOnDismissListener(d -> {
+      if (comparison != null) comparison.cancelPick();
       AppLog.i(TAG, "Server library dialog dismissed");
       serverDialog = null;
       serverVideoRecyclerView = null;
@@ -3335,6 +3439,7 @@ public class MainActivity extends AppCompatActivity {
   }
 
   private void clearServerRecentVideos() {
+    if (comparison != null) comparison.end();
     AppLog.i(TAG, () -> "Clearing server recent videos: count=" + serverPlayedVideos.size()
         + ", currentFromServer=" + currentVideoFromServer);
     serverPlayedVideos.clear();
@@ -3436,6 +3541,7 @@ public class MainActivity extends AppCompatActivity {
   }
 
   private void saveCurrentVideoProgress() {
+    if (comparingVideos()) return;
     if (player == null || currentVideo == null) {
       AppLog.d(TAG, "Skipping progress save: no player or current video");
       return;
@@ -3511,6 +3617,7 @@ public class MainActivity extends AppCompatActivity {
   }
 
   private void saveCurrentProjectionMode() {
+    if (comparingVideos()) return;
     if (currentVideo == null) {
       return;
     }
@@ -3545,6 +3652,7 @@ public class MainActivity extends AppCompatActivity {
   }
 
   private void savePlaybackSpeedForCurrentVideo() {
+    if (comparingVideos()) return;
     if (currentVideo == null || playbackSpeedPreferences == null) {
       return;
     }
@@ -3563,7 +3671,7 @@ public class MainActivity extends AppCompatActivity {
 
   private void applyPlaybackSpeed() {
     if (player != null) {
-      player.setPlaybackSpeed(playbackSpeed);
+      if (comparingVideos()) comparison.setSpeed(playbackSpeed); else player.setPlaybackSpeed(playbackSpeed);
     }
   }
 
@@ -3667,6 +3775,7 @@ public class MainActivity extends AppCompatActivity {
   }
 
   private void syncCurrentServerProgressIfDue() {
+    if (comparingVideos()) return;
     if (!currentVideoFromServer || currentServerVideo == null || currentVideo == null || player == null) {
       return;
     }
@@ -4220,7 +4329,7 @@ public class MainActivity extends AppCompatActivity {
     }
   }
 
-  private static final class ServerVideo {
+  static final class ServerVideo {
     final String id;
     final String title;
     final String fileName;

@@ -225,6 +225,13 @@
           app:icon="@drawable/ic_center_focus_24"
           app:iconGravity="textStart" />
 
+      <LinearLayout
+          android:id="@+id/comparisonPanel"
+          android:layout_width="match_parent"
+          android:layout_height="wrap_content"
+          android:orientation="vertical"
+          android:visibility="gone" />
+
       <com.google.android.material.button.MaterialButton
           android:id="@+id/windowsFullscreenButton"
           style="@style/Widget.MaterialComponents.Button.OutlinedButton"
@@ -496,6 +503,14 @@
           android:layout_height="48dp"
           android:layout_marginTop="8dp"
           android:text="Clear server recent videos" />
+
+      <com.google.android.material.button.MaterialButton
+          android:id="@+id/compareVideosButton"
+          style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+          android:layout_width="match_parent"
+          android:layout_height="48dp"
+          android:layout_marginTop="8dp"
+          android:text="Compare server versions" />
 
       <TextView
           android:layout_width="match_parent"
