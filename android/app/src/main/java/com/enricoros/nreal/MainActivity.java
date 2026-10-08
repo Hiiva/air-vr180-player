@@ -1813,6 +1813,10 @@ public class MainActivity extends AppCompatActivity {
                 + ", activeToken=" + serverRefreshPollToken);
             return;
           }
+          // A refresh must preserve the user's browsing position even when it finishes.
+          // Only the initial library load should apply the saved jump-to-last preference.
+          boolean initialDialogLoad = !manualRefresh && pollAttempt == 0 && !serverVideosLoadedThisSession;
+          ServerListScrollAnchor scrollAnchor = captureServerListScrollAnchor();
           if (!loadedServerUrl.equals(serverUrl)) {
             settingsPreferences.edit().putString(PREF_SERVER_URL, loadedServerUrl).apply();
             binding.serverUrlEditText.setText(loadedServerUrl);
@@ -1833,7 +1837,11 @@ public class MainActivity extends AppCompatActivity {
             refreshButton.setEnabled(true);
           }
           renderServerDialogRows();
-          jumpToLastServerVideo();
+          if (initialDialogLoad) {
+            positionServerListOnOpen();
+          } else {
+            restoreServerListScrollAnchor(scrollAnchor);
+          }
           if (result.refreshing && pollAttempt < SERVER_REFRESH_POLL_MAX_ATTEMPTS) {
             scheduleServerRefreshPoll(refreshButton, pollToken, pollAttempt + 1);
           }
@@ -3369,8 +3377,11 @@ public class MainActivity extends AppCompatActivity {
     List<ServerVideo> videos = new ArrayList<>();
     String query = normalizedServerSearchQuery();
     String[] queryTerms = query.length() == 0 ? new String[0] : query.split(" ");
+    String selectedVideoId = currentSelectedServerVideoId();
     for (ServerVideo video : source) {
-      if ("unseen".equals(serverDialogTab) && video.watchedTimeMs >= SERVER_UNSEEN_WATCH_LIMIT_MS) {
+      if ("unseen".equals(serverDialogTab)
+          && video.watchedTimeMs >= SERVER_UNSEEN_WATCH_LIMIT_MS
+          && !video.id.equals(selectedVideoId)) {
         continue;
       }
       if (query.length() == 0 || matchesServerSearch(video, queryTerms)) {
@@ -3380,6 +3391,14 @@ public class MainActivity extends AppCompatActivity {
     String sort = settingsPreferences.getString(PREF_SERVER_SORT, SORT_NAME_ASC);
     videos.sort((left, right) -> compareServerVideos(left, right, sort));
     return videos;
+  }
+
+  private String currentSelectedServerVideoId() {
+    if (windowsRemoteEnabled && windowsRemoteState != null
+        && windowsRemoteState.currentServerId.length() > 0) {
+      return windowsRemoteState.currentServerId;
+    }
+    return currentServerVideo == null ? "" : currentServerVideo.id;
   }
 
   private String normalizedServerSearchQuery() {
@@ -3415,10 +3434,10 @@ public class MainActivity extends AppCompatActivity {
       AppLog.d(TAG, () -> "Adjacent server playback ignored: no visible videos, direction=" + direction);
       return;
     }
-    String currentId = windowsRemoteEnabled && windowsRemoteState != null
-        && windowsRemoteState.currentServerId.length() > 0
-        ? windowsRemoteState.currentServerId
-        : (currentServerVideo != null ? currentServerVideo.id : latestServerHistoryId());
+    String currentId = currentSelectedServerVideoId();
+    if (currentId.length() == 0) {
+      currentId = latestServerHistoryId();
+    }
     int index = -1;
     for (int i = 0; i < visible.size(); i++) {
       if (visible.get(i).id.equals(currentId)) {
@@ -3466,6 +3485,65 @@ public class MainActivity extends AppCompatActivity {
         }
       });
     }
+  }
+
+  private ServerListScrollAnchor captureServerListScrollAnchor() {
+    if (serverVideoRecyclerView == null) return null;
+    RecyclerView.LayoutManager manager = serverVideoRecyclerView.getLayoutManager();
+    if (!(manager instanceof LinearLayoutManager)) return null;
+    LinearLayoutManager layoutManager = (LinearLayoutManager) manager;
+    int position = layoutManager.findFirstVisibleItemPosition();
+    if (position < 0) return null;
+    List<ServerVideo> visible = getVisibleServerVideos();
+    if (position >= visible.size()) return null;
+    View firstVisible = layoutManager.findViewByPosition(position);
+    int offset = firstVisible == null ? 0 : firstVisible.getTop() - serverVideoRecyclerView.getPaddingTop();
+    return new ServerListScrollAnchor(visible.get(position).id, position, offset);
+  }
+
+  private void restoreServerListScrollAnchor(ServerListScrollAnchor anchor) {
+    if (anchor == null || serverVideoRecyclerView == null) return;
+    RecyclerView recyclerView = serverVideoRecyclerView;
+    List<ServerVideo> visible = getVisibleServerVideos();
+    int targetPosition = -1;
+    for (int i = 0; i < visible.size(); i++) {
+      if (visible.get(i).id.equals(anchor.videoId)) {
+        targetPosition = i;
+        break;
+      }
+    }
+    if (targetPosition < 0 && !visible.isEmpty()) {
+      targetPosition = Math.min(anchor.fallbackPosition, visible.size() - 1);
+    }
+    if (targetPosition < 0) return;
+    int finalTargetPosition = targetPosition;
+    recyclerView.post(() -> {
+      if (serverVideoRecyclerView != recyclerView) return;
+      RecyclerView.LayoutManager manager = recyclerView.getLayoutManager();
+      if (manager instanceof LinearLayoutManager) {
+        ((LinearLayoutManager) manager).scrollToPositionWithOffset(finalTargetPosition, anchor.offsetPx);
+      } else {
+        recyclerView.scrollToPosition(finalTargetPosition);
+      }
+    });
+  }
+
+  private void positionServerListOnOpen() {
+    if (serverVideoRecyclerView == null) return;
+    if (settingsPreferences.getBoolean(PREF_SERVER_JUMP_LAST, true)) {
+      jumpToLastServerVideo();
+      return;
+    }
+    RecyclerView recyclerView = serverVideoRecyclerView;
+    recyclerView.post(() -> {
+      if (serverVideoRecyclerView != recyclerView) return;
+      RecyclerView.LayoutManager manager = recyclerView.getLayoutManager();
+      if (manager instanceof LinearLayoutManager) {
+        ((LinearLayoutManager) manager).scrollToPositionWithOffset(0, 0);
+      } else {
+        recyclerView.scrollToPosition(0);
+      }
+    });
   }
 
   private void toggleServerDeleteFlag(ServerVideo video) {
@@ -4712,6 +4790,18 @@ public class MainActivity extends AppCompatActivity {
         this.meta = meta;
         this.flagButton = flagButton;
       }
+    }
+  }
+
+  private static final class ServerListScrollAnchor {
+    final String videoId;
+    final int fallbackPosition;
+    final int offsetPx;
+
+    ServerListScrollAnchor(String videoId, int fallbackPosition, int offsetPx) {
+      this.videoId = videoId;
+      this.fallbackPosition = fallbackPosition;
+      this.offsetPx = offsetPx;
     }
   }
 
