@@ -3761,6 +3761,7 @@ public class MainActivity extends AppCompatActivity {
     lastWatchTimeElapsedMs = SystemClock.elapsedRealtime();
     if (!incognitoMode) {
       resetWatchTimeTracking();
+      flushPendingServerHistorySyncs();
     }
     AppLog.i(TAG, "Incognito mode changed: enabled=" + incognitoMode);
   }
@@ -4209,6 +4210,8 @@ public class MainActivity extends AppCompatActivity {
   }
 
   private void flushPendingServerHistorySyncs() {
+    // Incognito sessions must not replay writes left over from earlier, non-private sessions.
+    if (incognitoMode) return;
     JSONObject pending;
     synchronized (serverHistoryPendingLock) {
       pending = loadPendingServerHistory();
@@ -4248,18 +4251,40 @@ public class MainActivity extends AppCompatActivity {
         String endpoint = serverUrl + "/videos/" + videoId + "/history?played="
             + pendingItem.optBoolean("played", false);
         executeServerHistoryRequest("PUT", endpoint, payload.toString());
-        synchronized (serverHistoryPendingLock) {
-          JSONObject pending = loadPendingServerHistory();
-          JSONObject current = pending.optJSONObject(videoId);
-          if (current != null && token.equals(current.optString("token", ""))) {
-            pending.remove(videoId);
-            settingsPreferences.edit().putString(PREF_SERVER_HISTORY_PENDING, pending.toString()).commit();
-          }
+        removePendingServerHistorySyncIfCurrent(videoId, token);
+      } catch (ServerHistoryHttpException e) {
+        if (e.statusCode == HttpURLConnection.HTTP_NOT_FOUND
+            || e.statusCode == HttpURLConnection.HTTP_GONE) {
+          removePendingServerHistorySyncIfCurrent(videoId, token);
+          AppLog.i(TAG, "Discarded obsolete server history sync: id=" + videoId
+              + ", status=" + e.statusCode);
+        } else {
+          AppLog.w(TAG, "Server history sync failed; update remains queued: id=" + videoId, e);
         }
       } catch (IOException e) {
         AppLog.w(TAG, "Server history sync failed; update remains queued: id=" + videoId, e);
       }
     });
+  }
+
+  private void removePendingServerHistorySyncIfCurrent(String videoId, String token) {
+    synchronized (serverHistoryPendingLock) {
+      JSONObject pending = loadPendingServerHistory();
+      JSONObject current = pending.optJSONObject(videoId);
+      if (current != null && token.equals(current.optString("token", ""))) {
+        pending.remove(videoId);
+        settingsPreferences.edit().putString(PREF_SERVER_HISTORY_PENDING, pending.toString()).commit();
+      }
+    }
+  }
+
+  private static final class ServerHistoryHttpException extends IOException {
+    final int statusCode;
+
+    ServerHistoryHttpException(int statusCode, String responseBody) {
+      super("HTTP " + statusCode + (responseBody.length() > 0 ? ": " + responseBody : ""));
+      this.statusCode = statusCode;
+    }
   }
 
   private void queueClearServerHistory() {
@@ -4299,7 +4324,7 @@ public class MainActivity extends AppCompatActivity {
     String responseBody = readFully(stream);
     connection.disconnect();
     if (statusCode < 200 || statusCode >= 300) {
-      throw new IOException("HTTP " + statusCode + (responseBody.length() > 0 ? ": " + responseBody : ""));
+      throw new ServerHistoryHttpException(statusCode, responseBody);
     }
   }
 

@@ -814,6 +814,18 @@ def find_video_or_404(video_file_id: str) -> VideoFile:
     raise HTTPException(status_code=404, detail="Video not found")
 
 
+def find_indexed_history_video_or_404(video_file_id: str) -> VideoFile:
+    # A history retry must never rescan the video drives. The index already contains all
+    # metadata needed to update watched time, including for an offline source drive.
+    entries = load_library_snapshot()
+    if not entries and current_library_snapshot_scanned_at() <= 0.0:
+        raise HTTPException(status_code=503, detail="Library index not ready")
+    for entry in entries.values():
+        if entry.id == video_file_id:
+            return entry_to_video(entry, [])
+    raise HTTPException(status_code=404, detail="Video not in library index")
+
+
 def public_video(request: Request, video: VideoFile) -> dict[str, object]:
     api_key = get_api_key()
     thumbnail_url = str(request.url_for("cached_thumbnail", thumbnail_key=thumbnail_key(video)))
@@ -928,7 +940,7 @@ def get_history(request: Request) -> dict[str, object]:
 @app.put("/videos/{video_file_id}/history")
 async def update_history(video_file_id: str, request: Request, played: bool = Query(default=False)) -> dict[str, object]:
     require_api_key(request.headers.get("x-api-key"), request.query_params.get("api_key"))
-    video = find_video_or_404(video_file_id)
+    video = find_indexed_history_video_or_404(video_file_id)
     payload = await request.json()
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Expected a history object")
