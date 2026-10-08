@@ -34,7 +34,7 @@ public final class VrVideoSurfaceView extends GLSurfaceView implements Vr180Rend
       }
 
       @Override
-      public void onVideoFrameAvailable(int surfaceIndex) {
+      public void onVideoFrameAvailable(int surfaceIndex, long latchedElapsedRealtimeNs) {
       }
     });
   }

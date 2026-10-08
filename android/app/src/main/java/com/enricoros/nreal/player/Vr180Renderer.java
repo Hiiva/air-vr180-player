@@ -7,6 +7,7 @@ import android.opengl.GLES11Ext;
 import android.opengl.GLES20;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.view.Surface;
 
 import com.enricoros.nreal.AppLog;
@@ -22,7 +23,17 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
 
     void onVideoSurfaceDestroyed(int surfaceIndex, Surface surface);
 
-    void onVideoFrameAvailable(int surfaceIndex);
+    default void onVideoFrameLatched(int surfaceIndex) {}
+
+    default int getNextScheduledSurfaceIndex(int surfaceGroup) { return -1; }
+
+    default boolean isScheduledVideoModeActive(int surfaceGroup) { return false; }
+
+    default long getNextScheduledTargetTimeNs(int surfaceGroup) { return Long.MIN_VALUE; }
+
+    default void onVideoFramePresented(int surfaceIndex) {}
+
+    void onVideoFrameAvailable(int surfaceIndex, long latchedElapsedRealtimeNs);
   }
 
   public interface RenderInvalidator {
@@ -30,7 +41,26 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
   }
 
   public static final int VIDEO_GROUP_COUNT = 3;
-  public static final int VIDEO_SURFACE_COUNT = VIDEO_GROUP_COUNT * 2;
+  public static final int LEGACY_VIDEO_SURFACE_COUNT = VIDEO_GROUP_COUNT * 2;
+  public static final int VIDEO_SURFACE_COUNT = LEGACY_VIDEO_SURFACE_COUNT;
+
+  public static int surfaceGroupForIndex(int surfaceIndex) {
+    return surfaceIndex < LEGACY_VIDEO_SURFACE_COUNT
+        ? surfaceIndex / 2
+        : surfaceIndex - LEGACY_VIDEO_SURFACE_COUNT;
+  }
+
+  public static int surfaceLaneForIndex(int surfaceIndex) {
+    return surfaceIndex < LEGACY_VIDEO_SURFACE_COUNT ? surfaceIndex % 2 : 2;
+  }
+
+  public static int surfaceIndexForLane(int surfaceGroup, int lane) {
+    return lane >= 0 && lane < 2 ? surfaceGroup * 2 + lane : -1;
+  }
+
+  public static boolean isLegacySurfaceIndex(int surfaceIndex) {
+    return surfaceIndex >= 0 && surfaceIndex < LEGACY_VIDEO_SURFACE_COUNT;
+  }
   private static final float BASE_HORIZONTAL_FOV_DEGREES = 40.605104f;
   public static final int PROJECTION_EQUIRECT_VR180 = 0;
   public static final int PROJECTION_FISHEYE_VR190 = 1;
@@ -181,7 +211,7 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
     if (activeSurfaceIndex != surfaceIndex) {
       AppLog.i(TAG, () -> "Active surface changed: " + activeSurfaceIndex + " -> " + surfaceIndex);
     }
-    activeSurfaceGroup = surfaceIndex / 2;
+    activeSurfaceGroup = surfaceGroupForIndex(surfaceIndex);
     activeSurfaceIndex = newestSurfaceInGroup[activeSurfaceGroup];
     requestRender();
   }
@@ -296,9 +326,33 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
     if (nextFrameTimeNs == 0 || frameTimeNs - nextFrameTimeNs > intervalNs) {
       nextFrameTimeNs = frameTimeNs;
     }
+
+    boolean scheduledMode = false;
+    for (int group = 0; group < VIDEO_GROUP_COUNT; group++) {
+      if (surfaceCallback.isScheduledVideoModeActive(group)) {
+        scheduledMode = true;
+        break;
+      }
+    }
+
+    int latchedGroups = 0;
+    if (scheduledMode) {
+      final long latchPhaseNs = 2_000_000L;
+      long latchTimeNs = nextFrameTimeNs - intervalNs + latchPhaseNs;
+      while (frameTimeNs < latchTimeNs) {
+        LockSupport.parkNanos(latchTimeNs - frameTimeNs);
+        frameTimeNs = System.nanoTime();
+      }
+      latchedGroups = updateAvailableVideoFramesScheduled(0, nextFrameTimeNs);
+    }
     while (frameTimeNs < nextFrameTimeNs) {
       LockSupport.parkNanos(nextFrameTimeNs - frameTimeNs);
       frameTimeNs = System.nanoTime();
+    }
+    if (scheduledMode) {
+      // Give frames that arrived during this refresh interval one final chance to be used for the
+      // upcoming draw, but never latch two frames from the same group in one displayed refresh.
+      updateAvailableVideoFramesScheduled(latchedGroups, nextFrameTimeNs);
     }
     nextFrameTimeNs += intervalNs;
     EGLExt.eglPresentationTimeANDROID(EGL14.eglGetCurrentDisplay(),
@@ -308,7 +362,9 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
       return;
     }
 
-    updateAvailableVideoFrames();
+    if (!scheduledMode) {
+      updateAvailableVideoFramesStable();
+    }
 
     GLES20.glUseProgram(program);
     GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
@@ -387,7 +443,7 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
     requestRender();
   }
 
-  private void updateAvailableVideoFrames() {
+  private void updateAvailableVideoFramesStable() {
     boolean[] shouldUpdate = new boolean[VIDEO_SURFACE_COUNT];
     synchronized (frameLock) {
       for (int i = 0; i < VIDEO_SURFACE_COUNT; i++) {
@@ -402,19 +458,90 @@ public final class Vr180Renderer implements android.opengl.GLSurfaceView.Rendere
       }
       surfaceTexture.updateTexImage();
       surfaceTexture.getTransformMatrix(videoTransforms[i]);
-      // Parallel HEVC releases both decoder surfaces in presentation order, with monotonic
-      // surface timestamps. A delayed callback from the other decoder must not replace
-      // a newer frame acquired in a previous draw.
       long timestampNs = surfaceTexture.getTimestamp();
-      int group = i / 2;
+      int group = surfaceGroupForIndex(i);
       if (timestampNs >= newestVideoTimestampNs[group]) {
         newestVideoTimestampNs[group] = timestampNs;
         newestSurfaceInGroup[group] = i;
-        if (group == activeSurfaceGroup) activeSurfaceIndex = i;
+        if (group == activeSurfaceGroup) {
+          activeSurfaceIndex = i;
+        }
       }
       final int surfaceIndex = i;
-      mainHandler.post(() -> surfaceCallback.onVideoFrameAvailable(surfaceIndex));
+      long latchedElapsedRealtimeNs = SystemClock.elapsedRealtimeNanos();
+      mainHandler.post(() -> surfaceCallback.onVideoFrameAvailable(surfaceIndex, latchedElapsedRealtimeNs));
     }
+  }
+
+  private int updateAvailableVideoFramesScheduled(int skipGroupMask, long displayTimeNs) {
+    int latchedGroupMask = 0;
+    for (int group = 0; group < VIDEO_GROUP_COUNT; group++) {
+      if ((skipGroupMask & (1 << group)) != 0) {
+        continue;
+      }
+      int scheduledSurface = surfaceCallback.getNextScheduledSurfaceIndex(group);
+      if (scheduledSurface >= 0
+          && scheduledSurface < VIDEO_SURFACE_COUNT
+          && surfaceGroupForIndex(scheduledSurface) == group) {
+        long targetTimeNs = surfaceCallback.getNextScheduledTargetTimeNs(group);
+        if (targetTimeNs != Long.MIN_VALUE && targetTimeNs > displayTimeNs) {
+          continue;
+        }
+        if (takeFrameAvailable(scheduledSurface)) {
+          latchVideoSurface(scheduledSurface, true);
+          latchedGroupMask |= 1 << group;
+        }
+        continue;
+      }
+
+      for (int lane = 0; lane < 2; lane++) {
+        int surfaceIndex = surfaceIndexForLane(group, lane);
+        if (takeFrameAvailable(surfaceIndex)) {
+          latchVideoSurface(surfaceIndex, false);
+          latchedGroupMask |= 1 << group;
+        }
+      }
+    }
+    return latchedGroupMask;
+  }
+
+  private boolean takeFrameAvailable(int surfaceIndex) {
+    synchronized (frameLock) {
+      if (!frameAvailable[surfaceIndex]) {
+        return false;
+      }
+      frameAvailable[surfaceIndex] = false;
+      return true;
+    }
+  }
+
+  private void latchVideoSurface(int surfaceIndex, boolean scheduled) {
+    SurfaceTexture surfaceTexture = surfaceTextures[surfaceIndex];
+    if (surfaceTexture == null) {
+      return;
+    }
+    surfaceTexture.updateTexImage();
+    surfaceTexture.getTransformMatrix(videoTransforms[surfaceIndex]);
+    long timestampNs = surfaceTexture.getTimestamp();
+    int group = surfaceGroupForIndex(surfaceIndex);
+
+    if (scheduled || timestampNs >= newestVideoTimestampNs[group]) {
+      newestVideoTimestampNs[group] = timestampNs;
+      newestSurfaceInGroup[group] = surfaceIndex;
+      if (group == activeSurfaceGroup) {
+        activeSurfaceIndex = surfaceIndex;
+      }
+    }
+
+    if (scheduled) {
+      surfaceCallback.onVideoFramePresented(surfaceIndex);
+    }
+    // Clear the scheduled-lane gate before waking the playback renderer. Waking first creates a
+    // race where Media3 immediately sees the old lane still pending and refuses to release the
+    // next frame, costing an entire 90 Hz refresh.
+    surfaceCallback.onVideoFrameLatched(surfaceIndex);
+    long latchedElapsedRealtimeNs = SystemClock.elapsedRealtimeNanos();
+    mainHandler.post(() -> surfaceCallback.onVideoFrameAvailable(surfaceIndex, latchedElapsedRealtimeNs));
   }
 
   private void requestRender() {

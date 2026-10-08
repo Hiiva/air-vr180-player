@@ -42,6 +42,7 @@ import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.media3.common.C;
+import androidx.media3.common.Format;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.Player;
@@ -66,8 +67,11 @@ import com.enricoros.nreal.player.HevcPlaybackRenderersFactory;
 import com.enricoros.nreal.player.ProjectionModeGuesser;
 import com.enricoros.nreal.player.RecentVideo;
 import com.enricoros.nreal.player.RecentVideoStore;
+import com.enricoros.nreal.player.RetainedHttpDataSource;
 import com.enricoros.nreal.player.SavedScene;
 import com.enricoros.nreal.player.SavedSceneStore;
+import com.enricoros.nreal.player.SharedMemoryPrefetchDataSource;
+import com.enricoros.nreal.player.TimeGatedLoadControl;
 import com.enricoros.nreal.player.Vr180Renderer;
 import com.enricoros.nreal.player.VrPlayerPresentation;
 import com.google.android.material.dialog.MaterialAlertDialogBuilder;
@@ -121,6 +125,7 @@ public class MainActivity extends AppCompatActivity {
   private static final String PREFS_NAME = "player_settings";
   private static final String PLAYBACK_SPEED_PREFS_NAME = "video_playback_speeds";
   private static final String PREF_AUDIO_MUTED = "audio_muted";
+  private static final String PREF_INCOGNITO_MODE = "incognito_mode";
   private static final String PREF_VIEW_SCALE = "view_scale";
   private static final String PREF_SCENE_CENTER_DEGREES = "scene_center_degrees";
   private static final String PREF_HORIZON_DEGREES = "horizon_degrees";
@@ -154,8 +159,15 @@ public class MainActivity extends AppCompatActivity {
   private static final int PLAYER_CONSTRAINED_MAX_BUFFER_MS = 8_000;
   private static final int PLAYER_BUFFER_FOR_PLAYBACK_MS = 250;
   private static final int PLAYER_BUFFER_FOR_REBUFFER_MS = 1_000;
+  private static final int PLAYER_ACCELERATED_SERVER_START_BUFFER_MS = 4_000;
   private static final int PLAYER_BACK_BUFFER_MS = 30_000;
   private static final int PLAYER_CONSTRAINED_BACK_BUFFER_MS = 0;
+  private static final int PLAYER_SERVER_TARGET_BUFFER_BYTES = 128 * 1024 * 1024;
+  private static final int PLAYER_SERVER_PREFETCH_BUFFER_BYTES = 512 * 1024 * 1024;
+  private static final long PLAYER_SERVER_PREFETCH_MIN_BITRATE_BPS = 160_000_000L;
+  private static final int PLAYER_SERVER_SOURCE_DEFAULT = 0;
+  private static final int PLAYER_SERVER_SOURCE_RETAINED_HTTP = 1;
+  private static final int PLAYER_SERVER_SOURCE_SHARED_PREFETCH = 2;
   // Bound compressed-data buffering to leave memory available for codec output textures.
   private static final int PLAYER_CONSTRAINED_TARGET_BUFFER_BYTES = 96 * 1024 * 1024;
   private static final long CONSTRAINED_BUFFER_MIN_BITRATE_BPS = 70_000_000L;
@@ -199,6 +211,9 @@ public class MainActivity extends AppCompatActivity {
       new HevcPlaybackRenderersFactory.Surfaces()
   };
   private boolean playerUsesConstrainedBuffers = false;
+  private boolean playerUsesServerDataSource = false;
+  private boolean playerUsesAcceleratedDecode = false;
+  private int playerServerDataSourceMode = PLAYER_SERVER_SOURCE_DEFAULT;
   private String playerServerApiKey = "";
   private volatile int thumbnailLoadGeneration = 0;
   private final Surface[] videoSurfaces = new Surface[Vr180Renderer.VIDEO_SURFACE_COUNT];
@@ -235,6 +250,7 @@ public class MainActivity extends AppCompatActivity {
   private float sceneCenterDegrees = 0.0f;
   private float horizonDegrees = 0.0f;
   private boolean audioMuted = false;
+  private boolean incognitoMode = false;
   private long loopStartMs = C.TIME_UNSET;
   private long loopEndMs = C.TIME_UNSET;
   private boolean loopPaused = false;
@@ -242,9 +258,15 @@ public class MainActivity extends AppCompatActivity {
   private long lastStatusElapsedMs = 0L;
   private long lastTrackingLogElapsedMs = 0L;
   private long lastVideoFrameLogElapsedMs = 0L;
+  private long presentedCadenceWindowStartNs = 0L;
+  private long lastPresentedFrameNs = 0L;
+  private long maxPresentedFrameGapNs = 0L;
   private int loopBoundaryGeneration = 0;
   private int trackingSamplesSinceLastLog = 0;
   private int videoFramesSinceLastLog = 0;
+  private int presentedFramesInWindow = 0;
+  private int presentedFrameGapsOver20Ms = 0;
+  private int presentedFrameGapsOver33Ms = 0;
   private String lastDeviceMessage = "";
   private String playbackMessage = "";
   private boolean progressUpdatesScheduled = false;
@@ -340,6 +362,8 @@ public class MainActivity extends AppCompatActivity {
       AppLog.d(TAG, () -> "Playback state changed: " + playbackStateName(playbackState)
           + ", current=" + currentVideoTitleForLog()
           + ", positionMs=" + (player == null ? 0L : Math.max(0L, player.getCurrentPosition()))
+          + ", bufferedAheadMs=" + (player == null ? 0L : Math.max(
+              0L, player.getBufferedPosition() - player.getCurrentPosition()))
           + ", durationMs=" + getKnownDuration());
       if (playbackState == Player.STATE_ENDED && isLoopActive()) {
         seekToLoopStart();
@@ -382,6 +406,13 @@ public class MainActivity extends AppCompatActivity {
       AppLog.i(TAG, () -> "Video size changed: " + videoSize.width + "x" + videoSize.height
           + ", unappliedRotation=" + videoSize.unappliedRotationDegrees
           + ", pixelRatio=" + videoSize.pixelWidthHeightRatio);
+      Format format = player == null ? null : player.getVideoFormat();
+      if (format != null) {
+        AppLog.i(TAG, "Video format: frameRate=" + format.frameRate
+            + ", averageBitrate=" + format.averageBitrate
+            + ", peakBitrate=" + format.peakBitrate
+            + ", codecs=" + format.codecs);
+      }
       updatePlaybackUi();
     }
 
@@ -416,8 +447,10 @@ public class MainActivity extends AppCompatActivity {
       }
       AppLog.i(TAG, "Video surface created: index=" + surfaceIndex);
       videoSurfaces[surfaceIndex] = surface;
-      playbackSurfaces[surfaceIndex / 2].set(surfaceIndex % 2, surface);
-      if (comparingVideos()) {
+      int surfaceGroup = Vr180Renderer.surfaceGroupForIndex(surfaceIndex);
+      int surfaceLane = Vr180Renderer.surfaceLaneForIndex(surfaceIndex);
+      playbackSurfaces[surfaceGroup].set(surfaceLane, surface);
+      if (comparingVideos() && Vr180Renderer.isLegacySurfaceIndex(surfaceIndex)) {
         comparison.surfacesChanged();
       } else if (videoSurfaces[activeVideoSurfaceIndex] != null && videoSurfaces[activeVideoSurfaceIndex + 1] != null) {
         attachSlotSurface(player, activeVideoSurfaceIndex);
@@ -439,21 +472,66 @@ public class MainActivity extends AppCompatActivity {
       if (surfaceIndex == activeVideoSurfaceIndex && player != null) {
         player.clearVideoSurface(surface);
       }
-      if (comparingVideos()) comparison.surfaceLost(surfaceIndex);
+      if (comparingVideos() && Vr180Renderer.isLegacySurfaceIndex(surfaceIndex)) {
+        comparison.surfaceLost(surfaceIndex);
+      }
       videoSurfaceAttachedSurfaces[surfaceIndex] = null;
       videoSurfaces[surfaceIndex] = null;
-      playbackSurfaces[surfaceIndex / 2].set(surfaceIndex % 2, null);
+      playbackSurfaces[Vr180Renderer.surfaceGroupForIndex(surfaceIndex)]
+          .set(Vr180Renderer.surfaceLaneForIndex(surfaceIndex), null);
       updateStatus();
       updateKeepScreenOn();
     }
 
     @Override
-    public void onVideoFrameAvailable(int surfaceIndex) {
-      if (comparingVideos()) comparison.surfaceFrameAvailable(surfaceIndex);
+    public void onVideoFrameLatched(int surfaceIndex) {
+      if (isValidSurfaceIndex(surfaceIndex)) {
+        playbackSurfaces[Vr180Renderer.surfaceGroupForIndex(surfaceIndex)].frameLatched();
+      }
+    }
+
+    @Override
+    public int getNextScheduledSurfaceIndex(int surfaceGroup) {
+      if (surfaceGroup < 0 || surfaceGroup >= Vr180Renderer.VIDEO_GROUP_COUNT) {
+        return -1;
+      }
+      int lane = playbackSurfaces[surfaceGroup].peekScheduledLane();
+      return lane < 0 ? -1 : Vr180Renderer.surfaceIndexForLane(surfaceGroup, lane);
+    }
+
+    @Override
+    public boolean isScheduledVideoModeActive(int surfaceGroup) {
+      return surfaceGroup >= 0
+          && surfaceGroup < Vr180Renderer.VIDEO_GROUP_COUNT
+          && playbackSurfaces[surfaceGroup].isScheduledMode();
+    }
+
+    @Override
+    public long getNextScheduledTargetTimeNs(int surfaceGroup) {
+      if (surfaceGroup < 0 || surfaceGroup >= Vr180Renderer.VIDEO_GROUP_COUNT) {
+        return Long.MIN_VALUE;
+      }
+      return playbackSurfaces[surfaceGroup].peekScheduledTargetTimeNs();
+    }
+
+    @Override
+    public void onVideoFramePresented(int surfaceIndex) {
+      if (isValidSurfaceIndex(surfaceIndex)) {
+        playbackSurfaces[Vr180Renderer.surfaceGroupForIndex(surfaceIndex)]
+            .consumeScheduledLane(Vr180Renderer.surfaceLaneForIndex(surfaceIndex));
+      }
+    }
+
+    @Override
+    public void onVideoFrameAvailable(int surfaceIndex, long latchedElapsedRealtimeNs) {
+      if (comparingVideos() && Vr180Renderer.isLegacySurfaceIndex(surfaceIndex)) {
+        comparison.surfaceFrameAvailable(surfaceIndex);
+      }
       if (!isValidSurfaceIndex(surfaceIndex)) {
         AppLog.w(TAG, "Video frame received for invalid surface index " + surfaceIndex);
         return;
       }
+      recordPresentedFrameCadence(surfaceIndex, latchedElapsedRealtimeNs);
       if (LOG_VERBOSE_STATS) {
         videoFramesSinceLastLog++;
         long now = SystemClock.elapsedRealtime();
@@ -468,6 +546,44 @@ public class MainActivity extends AppCompatActivity {
         }
       }
     }
+
+    private void recordPresentedFrameCadence(int surfaceIndex, long latchedElapsedRealtimeNs) {
+      int surfaceGroup = Vr180Renderer.surfaceGroupForIndex(surfaceIndex);
+      if (!incognitoMode
+          || surfaceGroup != Vr180Renderer.surfaceGroupForIndex(activeVideoSurfaceIndex)) {
+        return;
+      }
+      long nowNs = latchedElapsedRealtimeNs;
+      if (presentedCadenceWindowStartNs == 0L) {
+        presentedCadenceWindowStartNs = nowNs;
+      }
+      if (lastPresentedFrameNs != 0L) {
+        long gapNs = Math.max(0L, nowNs - lastPresentedFrameNs);
+        maxPresentedFrameGapNs = Math.max(maxPresentedFrameGapNs, gapNs);
+        if (gapNs > 20_000_000L) presentedFrameGapsOver20Ms++;
+        if (gapNs > 33_000_000L) presentedFrameGapsOver33Ms++;
+      }
+      lastPresentedFrameNs = nowNs;
+      presentedFramesInWindow++;
+      long windowNs = nowNs - presentedCadenceWindowStartNs;
+      if (windowNs >= 5_000_000_000L) {
+        double fps = presentedFramesInWindow * 1_000_000_000.0 / windowNs;
+        AppLog.i(TAG, String.format(Locale.US,
+            "Presented cadence: fps=%.1f, frames=%d, windowMs=%d, maxGapMs=%.1f, gaps20=%d, gaps33=%d, speed=%.2fx",
+            fps,
+            presentedFramesInWindow,
+            windowNs / 1_000_000L,
+            maxPresentedFrameGapNs / 1_000_000.0,
+            presentedFrameGapsOver20Ms,
+            presentedFrameGapsOver33Ms,
+            playbackSpeed));
+        presentedCadenceWindowStartNs = nowNs;
+        maxPresentedFrameGapNs = 0L;
+        presentedFramesInWindow = 0;
+        presentedFrameGapsOver20Ms = 0;
+        presentedFrameGapsOver33Ms = 0;
+      }
+    }
   };
 
   @Override
@@ -477,6 +593,7 @@ public class MainActivity extends AppCompatActivity {
     playbackSpeedPreferences = getSharedPreferences(PLAYBACK_SPEED_PREFS_NAME, MODE_PRIVATE);
     installDevelopmentHttpsTrust();
     audioMuted = settingsPreferences.getBoolean(PREF_AUDIO_MUTED, false);
+    incognitoMode = settingsPreferences.getBoolean(PREF_INCOGNITO_MODE, false);
     viewScale = settingsPreferences.getFloat(PREF_VIEW_SCALE, DEFAULT_VIEW_SCALE);
     projectionMode = Vr180Renderer.PROJECTION_EQUIRECT_VR180;
     sceneCenterDegrees = settingsPreferences.getFloat(PREF_SCENE_CENTER_DEGREES, 0.0f);
@@ -497,6 +614,7 @@ public class MainActivity extends AppCompatActivity {
     AppLog.i(TAG, () -> "Loaded startup state: recentVideos=" + recentVideos.size()
         + ", serverPlayedVideos=" + serverPlayedVideos.size()
         + ", audioMuted=" + audioMuted
+        + ", incognitoMode=" + incognitoMode
         + ", viewScale=" + viewScale
         + ", sceneCenter=" + sceneCenterDegrees
         + ", horizon=" + horizonDegrees);
@@ -520,7 +638,9 @@ public class MainActivity extends AppCompatActivity {
           @Override public void pick() { openServerLibraryDialog(); }
           @Override public int slot() { return activeVideoSurfaceIndex; }
           @Override public long frameTimeUs() { return lastVideoFrameTimeUs; }
-          @Override public ExoPlayer create(int slot) { return createPlayer(true, slot); }
+          @Override public ExoPlayer create(int slot) {
+            return createPlayer(true, slot, PLAYER_SERVER_SOURCE_DEFAULT);
+          }
           @Override public boolean attach(ExoPlayer target, int slot) {
             if (videoSurfaces[slot] == null || videoSurfaces[slot + 1] == null) return false;
             attachSlotSurface(target, slot);
@@ -771,6 +891,10 @@ public class MainActivity extends AppCompatActivity {
       audioMuted = isChecked;
       settingsPreferences.edit().putBoolean(PREF_AUDIO_MUTED, audioMuted).apply();
       applyAudioMuted();
+    });
+    binding.incognitoModeSwitch.setChecked(incognitoMode);
+    binding.incognitoModeSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+      setIncognitoMode(isChecked);
     });
     binding.serverUrlEditText.setText(settingsPreferences.getString(PREF_SERVER_URL, ""));
     binding.serverUrlEditText.addTextChangedListener(new TextWatcher() {
@@ -1333,6 +1457,9 @@ public class MainActivity extends AppCompatActivity {
           + ", durationMs=" + createdVideo.durationMs
           + ", projection=" + projectionModeName(createdVideo.projectionMode));
     } else {
+      if (incognitoMode) {
+        video = copyRecentVideo(video);
+      }
       final RecentVideo existingVideo = video;
       AppLog.i(TAG, () -> "Reusing recent video entry: title=" + existingVideo.title
           + ", size=" + existingVideo.size
@@ -1345,8 +1472,10 @@ public class MainActivity extends AppCompatActivity {
         video.durationMs = queryDuration(uri);
       }
     }
-    RecentVideoStore.upsert(this, recentVideos, video);
-    renderRecentVideos();
+    if (!incognitoMode) {
+      RecentVideoStore.upsert(this, recentVideos, video);
+      renderRecentVideos();
+    }
     playLocalVideo(video);
   }
 
@@ -1360,37 +1489,73 @@ public class MainActivity extends AppCompatActivity {
   }
 
   private ExoPlayer createPlayer(boolean constrainedBuffers, int slot) {
+    return createPlayer(
+        constrainedBuffers,
+        slot,
+        serverDataSourceMode(currentVideo, playbackSpeed > 1.05f));
+  }
+
+  private ExoPlayer createPlayer(
+      boolean constrainedBuffers, int slot, int serverDataSourceMode) {
+    boolean serverPlayback = currentVideoFromServer;
+    boolean acceleratedDecode = playbackSpeed > 1.05f;
+    boolean timeGatedAcceleratedServer = constrainedBuffers
+        && acceleratedDecode
+        && serverPlayback
+        && serverDataSourceMode == PLAYER_SERVER_SOURCE_RETAINED_HTTP;
     int minBufferMs = constrainedBuffers ? PLAYER_CONSTRAINED_MIN_BUFFER_MS : PLAYER_MIN_BUFFER_MS;
     int maxBufferMs = constrainedBuffers ? PLAYER_CONSTRAINED_MAX_BUFFER_MS : PLAYER_MAX_BUFFER_MS;
-    int backBufferMs = constrainedBuffers ? PLAYER_CONSTRAINED_BACK_BUFFER_MS : PLAYER_BACK_BUFFER_MS;
+    if (timeGatedAcceleratedServer) {
+      minBufferMs = Math.max(minBufferMs, PLAYER_ACCELERATED_SERVER_START_BUFFER_MS);
+    }
+    final int resolvedMinBufferMs = minBufferMs;
+    int backBufferMs = constrainedBuffers || (acceleratedDecode && serverPlayback)
+        ? PLAYER_CONSTRAINED_BACK_BUFFER_MS
+        : PLAYER_BACK_BUFFER_MS;
     AppLog.i(TAG, () -> "Creating player: constrainedBuffers=" + constrainedBuffers
-        + ", minBufferMs=" + minBufferMs
+        + ", minBufferMs=" + resolvedMinBufferMs
         + ", maxBufferMs=" + maxBufferMs
         + ", backBufferMs=" + backBufferMs);
-    DefaultLoadControl.Builder loadControlBuilder = new DefaultLoadControl.Builder()
-        .setBufferDurationsMs(
-            minBufferMs,
-            maxBufferMs,
-            PLAYER_BUFFER_FOR_PLAYBACK_MS,
-            PLAYER_BUFFER_FOR_REBUFFER_MS)
-        .setBackBuffer(backBufferMs, !constrainedBuffers)
-        .setPrioritizeTimeOverSizeThresholds(!constrainedBuffers);
-    if (constrainedBuffers) {
-      loadControlBuilder.setTargetBufferBytes(PLAYER_CONSTRAINED_TARGET_BUFFER_BYTES);
+    DefaultLoadControl loadControl;
+    if (timeGatedAcceleratedServer) {
+      loadControl = new TimeGatedLoadControl(
+          resolvedMinBufferMs,
+          maxBufferMs,
+          PLAYER_ACCELERATED_SERVER_START_BUFFER_MS,
+          PLAYER_ACCELERATED_SERVER_START_BUFFER_MS,
+          PLAYER_SERVER_TARGET_BUFFER_BYTES,
+          backBufferMs);
+    } else {
+      DefaultLoadControl.Builder loadControlBuilder = new DefaultLoadControl.Builder()
+          .setBufferDurationsMs(
+              minBufferMs,
+              maxBufferMs,
+              PLAYER_BUFFER_FOR_PLAYBACK_MS,
+              PLAYER_BUFFER_FOR_REBUFFER_MS)
+          .setBackBuffer(backBufferMs, !constrainedBuffers && !(acceleratedDecode && serverPlayback))
+          .setPrioritizeTimeOverSizeThresholds(!constrainedBuffers && !(acceleratedDecode && serverPlayback));
+      if (constrainedBuffers) {
+        loadControlBuilder.setTargetBufferBytes(PLAYER_CONSTRAINED_TARGET_BUFFER_BYTES);
+      } else if (acceleratedDecode && serverPlayback) {
+        loadControlBuilder.setTargetBufferBytes(PLAYER_SERVER_TARGET_BUFFER_BYTES);
+      }
+      loadControl = loadControlBuilder.build();
     }
-    DefaultLoadControl loadControl = loadControlBuilder.build();
-    return new ExoPlayer.Builder(this, new HevcPlaybackRenderersFactory(this, playbackSurfaces[slot / 2]))
+    return new ExoPlayer.Builder(
+        this,
+        new HevcPlaybackRenderersFactory(
+            this, playbackSurfaces[slot / 2], acceleratedDecode))
         .setLoadControl(loadControl)
         .setPriority(C.PRIORITY_PLAYBACK)
         .setPriorityTaskManager(playbackPriorityTaskManager)
         .setSeekParameters(SeekParameters.CLOSEST_SYNC)
         .setMediaSourceFactory(new DefaultMediaSourceFactory(this)
-        .setDataSourceFactory(createDataSourceFactory()))
+        .setDataSourceFactory(createDataSourceFactory(serverDataSourceMode)))
         .build();
   }
 
 
-  private DataSource.Factory createDataSourceFactory() {
+  private DataSource.Factory createDataSourceFactory(int serverDataSourceMode) {
     AppLog.d(TAG, "Creating data source factory");
     DefaultHttpDataSource.Factory httpDataSourceFactory = new DefaultHttpDataSource.Factory()
         .setUserAgent("AirVrPlayer/1.0")
@@ -1400,6 +1565,14 @@ public class MainActivity extends AppCompatActivity {
     String apiKey = getServerApiKey();
     if (apiKey.length() > 0) {
       httpDataSourceFactory.setDefaultRequestProperties(Collections.singletonMap("X-API-Key", apiKey));
+    }
+    if (serverDataSourceMode == PLAYER_SERVER_SOURCE_SHARED_PREFETCH) {
+      return new SharedMemoryPrefetchDataSource.Factory(
+          httpDataSourceFactory, PLAYER_SERVER_PREFETCH_BUFFER_BYTES);
+    }
+    if (serverDataSourceMode == PLAYER_SERVER_SOURCE_RETAINED_HTTP) {
+      return new DefaultDataSource.Factory(
+          this, new RetainedHttpDataSource.Factory(httpDataSourceFactory));
     }
     return new DefaultDataSource.Factory(this, httpDataSourceFactory);
   }
@@ -1430,6 +1603,7 @@ public class MainActivity extends AppCompatActivity {
     updateProjectionModeControl();
     updatePlaybackSpeedControl();
     playbackMessage = "";
+    resetPresentedFrameCadence();
     resetLoop();
     binding.currentVideoTitle.setText(video.title);
     preparePlayerForVideoPlayback(video);
@@ -1465,8 +1639,10 @@ public class MainActivity extends AppCompatActivity {
         + ", lastPositionMs=" + serverVideo.lastPositionMs
         + ", windowsRemote=" + windowsRemoteEnabled);
     if (windowsRemoteEnabled) {
-      currentServerVideo = serverVideo;
-      upsertServerPlayedVideo(serverVideo);
+      currentServerVideo = incognitoMode ? serverVideo.copy() : serverVideo;
+      if (!incognitoMode) {
+        upsertServerPlayedVideo(serverVideo);
+      }
       closeServerDialog();
       renderServerDialogRows();
       sendWindowsRemoteCommand(commandJson("playServerId", "id", serverVideo.id));
@@ -1475,9 +1651,11 @@ public class MainActivity extends AppCompatActivity {
     saveCurrentVideoProgress();
     currentVideo = null;
     currentVideoFromServer = true;
-    currentServerVideo = serverVideo;
-    upsertServerPlayedVideo(serverVideo);
-    queueServerHistorySync(serverVideo, true);
+    currentServerVideo = incognitoMode ? serverVideo.copy() : serverVideo;
+    if (!incognitoMode) {
+      upsertServerPlayedVideo(serverVideo);
+      queueServerHistorySync(serverVideo, true);
+    }
     lastServerHistorySyncElapsedMs = SystemClock.elapsedRealtime();
     RecentVideo video = new RecentVideo(
         serverVideo.uri,
@@ -1504,6 +1682,8 @@ public class MainActivity extends AppCompatActivity {
     player = target;
     activeVideoSurfaceIndex = slot;
     playerUsesConstrainedBuffers = true;
+    playerUsesServerDataSource = true;
+    playerServerDataSourceMode = PLAYER_SERVER_SOURCE_DEFAULT;
     currentServerVideo = source.copy();
     currentVideoFromServer = true;
     currentVideo = new RecentVideo(source.uri, source.displayTitle(), source.size,
@@ -1517,8 +1697,15 @@ public class MainActivity extends AppCompatActivity {
   private void preparePlayerForVideoPlayback(RecentVideo video) {
     releaseThumbnailMemoryForPlayback();
     boolean constrainedBuffers = shouldConstrainPlayerBuffers(video);
+    boolean acceleratedDecode = playbackSpeed > 1.05f;
+    int serverDataSourceMode = serverDataSourceMode(video, acceleratedDecode);
     String serverApiKey = getServerApiKey();
-    if (player != null && playerUsesConstrainedBuffers == constrainedBuffers && playerServerApiKey.equals(serverApiKey)) {
+    if (player != null
+        && playerUsesConstrainedBuffers == constrainedBuffers
+        && playerUsesServerDataSource == currentVideoFromServer
+        && playerUsesAcceleratedDecode == acceleratedDecode
+        && playerServerDataSourceMode == serverDataSourceMode
+        && playerServerApiKey.equals(serverApiKey)) {
       AppLog.d(TAG, () -> "Keeping current player buffer profile: constrained=" + playerUsesConstrainedBuffers);
       attachSlotSurface(player, activeVideoSurfaceIndex);
       return;
@@ -1530,8 +1717,11 @@ public class MainActivity extends AppCompatActivity {
       clearSlotSurface(oldPlayer, activeVideoSurfaceIndex);
       oldPlayer.release();
     }
-    player = createPlayer(constrainedBuffers);
+    player = createPlayer(constrainedBuffers, activeVideoSurfaceIndex, serverDataSourceMode);
     playerUsesConstrainedBuffers = constrainedBuffers;
+    playerUsesServerDataSource = currentVideoFromServer;
+    playerUsesAcceleratedDecode = acceleratedDecode;
+    playerServerDataSourceMode = serverDataSourceMode;
     playerServerApiKey = serverApiKey;
     attachSlotSurface(player, activeVideoSurfaceIndex);
     applyAudioMuted();
@@ -1539,15 +1729,33 @@ public class MainActivity extends AppCompatActivity {
   }
 
   private boolean shouldConstrainPlayerBuffers(RecentVideo video) {
-    if (video == null || video.size <= 0L || video.durationMs <= 0L) {
-      return false;
-    }
-    long bitrateBps = video.size * 8_000L / video.durationMs;
+    long bitrateBps = estimatedBitrateBps(video);
     boolean constrained = bitrateBps >= CONSTRAINED_BUFFER_MIN_BITRATE_BPS;
-    AppLog.d(TAG, () -> "Estimated bitrate: title=" + video.title
+    String title = video == null ? "" : video.title;
+    AppLog.d(TAG, () -> "Estimated bitrate: title=" + title
         + ", bitrateBps=" + bitrateBps
         + ", constrainedBuffers=" + constrained);
     return constrained;
+  }
+
+  private int serverDataSourceMode(RecentVideo video, boolean acceleratedDecode) {
+    if (!currentVideoFromServer || !acceleratedDecode) {
+      return PLAYER_SERVER_SOURCE_DEFAULT;
+    }
+    long bitrateBps = estimatedBitrateBps(video);
+    if (bitrateBps >= PLAYER_SERVER_PREFETCH_MIN_BITRATE_BPS) {
+      return PLAYER_SERVER_SOURCE_SHARED_PREFETCH;
+    }
+    return bitrateBps >= CONSTRAINED_BUFFER_MIN_BITRATE_BPS
+        ? PLAYER_SERVER_SOURCE_RETAINED_HTTP
+        : PLAYER_SERVER_SOURCE_DEFAULT;
+  }
+
+  private static long estimatedBitrateBps(RecentVideo video) {
+    if (video == null || video.size <= 0L || video.durationMs <= 0L) {
+      return 0L;
+    }
+    return video.size * 8_000L / video.durationMs;
   }
 
   private void releaseThumbnailMemoryForPlayback() {
@@ -2169,6 +2377,7 @@ public class MainActivity extends AppCompatActivity {
 
   private void persistCurrentServerLoopPoints() {
     if (comparingVideos()) return;
+    if (incognitoMode) return;
     if (!currentVideoFromServer || currentVideo == null || currentServerVideo == null) {
       return;
     }
@@ -2355,7 +2564,8 @@ public class MainActivity extends AppCompatActivity {
       }
       videoSurfaceAttachedSurfaces[i] = null;
       videoSurfaces[i] = null;
-      playbackSurfaces[i / 2].set(i % 2, null);
+      playbackSurfaces[Vr180Renderer.surfaceGroupForIndex(i)]
+          .set(Vr180Renderer.surfaceLaneForIndex(i), null);
     }
     updateKeepScreenOn();
   }
@@ -3481,6 +3691,80 @@ public class MainActivity extends AppCompatActivity {
     return null;
   }
 
+  private static RecentVideo copyRecentVideo(RecentVideo video) {
+    return new RecentVideo(
+        video.uri,
+        video.title,
+        video.size,
+        video.lastPositionMs,
+        video.watchedTimeMs,
+        video.durationMs,
+        video.projectionMode);
+  }
+
+  private void resetPresentedFrameCadence() {
+    presentedCadenceWindowStartNs = 0L;
+    lastPresentedFrameNs = 0L;
+    maxPresentedFrameGapNs = 0L;
+    presentedFramesInWindow = 0;
+    presentedFrameGapsOver20Ms = 0;
+    presentedFrameGapsOver33Ms = 0;
+  }
+
+  private void setIncognitoMode(boolean enabled) {
+    if (incognitoMode == enabled) {
+      return;
+    }
+
+    if (enabled) {
+      // Persist the real session up to this boundary, then detach mutable per-video state so
+      // test playback cannot leak back into the in-memory recent/server history objects.
+      saveCurrentVideoProgress();
+      if (currentVideo != null) {
+        currentVideo = copyRecentVideo(currentVideo);
+      }
+      if (currentServerVideo != null) {
+        currentServerVideo = currentServerVideo.copy();
+      }
+      incognitoMode = true;
+    } else {
+      incognitoMode = false;
+      if (currentVideo != null) {
+        if (currentVideoFromServer && currentServerVideo != null) {
+          ServerVideo persistedServerVideo = findServerVideo(serverVideos, currentServerVideo.id);
+          if (persistedServerVideo != null) {
+            currentServerVideo = persistedServerVideo;
+            currentVideo = new RecentVideo(
+                persistedServerVideo.uri,
+                persistedServerVideo.displayTitle(),
+                persistedServerVideo.size,
+                persistedServerVideo.lastPositionMs,
+                persistedServerVideo.watchedTimeMs,
+                persistedServerVideo.durationMs,
+                persistedServerVideo.projectionMode);
+          }
+        } else {
+          RecentVideo persistedVideo = findRecentVideo(currentVideo.uri);
+          if (persistedVideo != null) {
+            currentVideo = persistedVideo;
+          } else {
+            RecentVideoStore.upsert(this, recentVideos, currentVideo);
+            renderRecentVideos();
+          }
+        }
+      }
+    }
+
+    settingsPreferences.edit().putBoolean(PREF_INCOGNITO_MODE, incognitoMode).apply();
+    resetPresentedFrameCadence();
+    watchTimeTrackingActive = false;
+    lastWatchTimeElapsedMs = SystemClock.elapsedRealtime();
+    if (!incognitoMode) {
+      resetWatchTimeTracking();
+    }
+    AppLog.i(TAG, "Incognito mode changed: enabled=" + incognitoMode);
+  }
+
   private void confirmClearRecentVideos(String title, String message, Runnable onConfirm) {
     new MaterialAlertDialogBuilder(this)
         .setTitle(title)
@@ -3610,6 +3894,7 @@ public class MainActivity extends AppCompatActivity {
 
   private void saveCurrentVideoProgress() {
     if (comparingVideos()) return;
+    if (incognitoMode) return;
     if (player == null || currentVideo == null) {
       AppLog.d(TAG, "Skipping progress save: no player or current video");
       return;
@@ -3646,7 +3931,7 @@ public class MainActivity extends AppCompatActivity {
   }
 
   private void updateWatchTimeTracking() {
-    boolean shouldTrack = player != null && currentVideo != null && player.isPlaying();
+    boolean shouldTrack = !incognitoMode && player != null && currentVideo != null && player.isPlaying();
     long now = SystemClock.elapsedRealtime();
     if (watchTimeTrackingActive) {
       long elapsedMs = Math.max(0L, now - lastWatchTimeElapsedMs);
@@ -3659,7 +3944,8 @@ public class MainActivity extends AppCompatActivity {
   }
 
   private void resetWatchTimeTracking() {
-    watchTimeTrackingActive = player != null && currentVideo != null && player.isPlaying();
+    watchTimeTrackingActive = !incognitoMode
+        && player != null && currentVideo != null && player.isPlaying();
     lastWatchTimeElapsedMs = SystemClock.elapsedRealtime();
   }
 
@@ -3686,6 +3972,7 @@ public class MainActivity extends AppCompatActivity {
 
   private void saveCurrentProjectionMode() {
     if (comparingVideos()) return;
+    if (incognitoMode) return;
     if (currentVideo == null) {
       return;
     }
@@ -3721,6 +4008,7 @@ public class MainActivity extends AppCompatActivity {
 
   private void savePlaybackSpeedForCurrentVideo() {
     if (comparingVideos()) return;
+    if (incognitoMode) return;
     if (currentVideo == null || playbackSpeedPreferences == null) {
       return;
     }
@@ -3738,8 +4026,26 @@ public class MainActivity extends AppCompatActivity {
   }
 
   private void applyPlaybackSpeed() {
+    resetPresentedFrameCadence();
     if (player != null) {
-      if (comparingVideos()) comparison.setSpeed(playbackSpeed); else player.setPlaybackSpeed(playbackSpeed);
+      if (comparingVideos()) {
+        comparison.setSpeed(playbackSpeed);
+        return;
+      }
+      boolean acceleratedDecode = playbackSpeed > 1.05f;
+      if (currentVideo != null && acceleratedDecode != playerUsesAcceleratedDecode) {
+        long positionMs = Math.max(0L, player.getCurrentPosition());
+        boolean playWhenReady = player.getPlayWhenReady();
+        clearLoopBoundaryMessage();
+        preparePlayerForVideoPlayback(currentVideo);
+        player.setMediaItem(MediaItem.fromUri(currentVideo.uri), positionMs);
+        player.prepare();
+        player.setPlaybackSpeed(playbackSpeed);
+        player.setPlayWhenReady(playWhenReady);
+        scheduleLoopBoundaryMessage();
+      } else {
+        player.setPlaybackSpeed(playbackSpeed);
+      }
     }
   }
 
@@ -3829,6 +4135,7 @@ public class MainActivity extends AppCompatActivity {
   }
 
   private void upsertServerPlayedVideo(ServerVideo video) {
+    if (incognitoMode) return;
     AppLog.d(TAG, () -> "Upserting server played video: id=" + video.id
         + ", title=" + video.displayTitle()
         + ", positionMs=" + video.lastPositionMs
@@ -3844,6 +4151,7 @@ public class MainActivity extends AppCompatActivity {
 
   private void syncCurrentServerProgressIfDue() {
     if (comparingVideos()) return;
+    if (incognitoMode) return;
     if (!currentVideoFromServer || currentServerVideo == null || currentVideo == null || player == null) {
       return;
     }
@@ -3868,6 +4176,7 @@ public class MainActivity extends AppCompatActivity {
   }
 
   private void queueServerHistorySync(ServerVideo video, boolean played) {
+    if (incognitoMode) return;
     String serverUrl = normalizeServerUrl(settingsPreferences.getString(PREF_SERVER_URL, ""));
     if (serverUrl.length() == 0) {
       AppLog.w(TAG, "Cannot queue server history without a server URL");
